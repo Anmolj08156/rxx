@@ -18,7 +18,7 @@ load_dotenv()
 
 # --- Configuration & Setup ---
 # Bearer token for API authentication as provided in the problem statement
-API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "74b1158d301e42af454a706d7610b664511de7b16c859c882a6bbb02cc936ed8")
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "6b330b572cbe55058f000377088af8082ea2e98c81de3606b6d4d8728c90166")
 
 # Google API Key is essential for Google Gemini models
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
