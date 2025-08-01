@@ -3,13 +3,11 @@ import requests
 from dotenv import load_dotenv
 import uuid
 from pathlib import Path
-import json # For parsing LLM output
-import re # For regex to clean LLM output
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel
+from typing import List, Optional
 
 # Langchain imports for RAG functionality
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader
@@ -37,12 +35,13 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY environment variable is not set. Please add it to your .env file or Render environment.")
 
-PDF_PATH = "policy.pdf" # This PDF is expected to be in the root of the project directory
+# Define the path to the merged PDF document (fallback/initial document)
+PDF_PATH = "policy.pdf"
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="LLM-Powered Intelligent Claim Processing System (Google Gemini)",
-    description="API for processing insurance claims based on policy documents, providing structured decisions and justifications.",
+    title="LLM-Powered Intelligent Query–Retrieval System (Google Gemini)",
+    description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains.",
     version="1.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
@@ -51,98 +50,148 @@ app = FastAPI(
 # --- Global RAG Chain Components ---
 default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
-llm_parser_model: Optional[ChatGoogleGenerativeAI] = None # Dedicated LLM for parsing claims
 
 
-# --- Prompt Engineering ---
+# --- Prompt Engineering with Few-Shot Examples ---
+# These examples directly teach the LLM the desired output format and style.
+# The citation format is used within the example answers to simulate document referencing.
+# The actual source document page numbers are manually added for demonstration.
+# IMPORTANT: The actual citations will depend on the RAG system's ability to extract metadata,
+# which the current setup (return_source_documents=False for simplicity) doesn't directly expose
+# to the LLM for generation in the string answer. For true dynamic citations, a more complex
+# chain that processes source_documents from RetrievalQA.invoke is needed.
+# For this prompt, the citations are illustrative of the desired *style*.
+PROMPT_TEMPLATE = """
+You are an expert in analyzing policy documents, contracts, and emails.
+Your task is to answer user queries accurately and concisely, based **only** on the provided context.
+If the answer is not found in the context, state: "I cannot answer this question based on the provided documents."
+Do not generate information that is not supported by the context.
+When providing an answer, aim for directness and precision, summarizing the key information from the policy.
 
-# Prompt for the main claim processing LLM
-INSURANCE_CLAIM_PROMPT = """
-You are an expert insurance claim processor with deep knowledge of policy terms, coverage rules, and claim evaluation. You must analyze claims systematically and provide structured decisions.
-Your primary goal is to answer the user's "Claim Question" based **strictly** on the "Policy Context" and "Claim Details".
+BEGIN EXAMPLES:
+Example Question: What is the grace period for premium payment under the National Parivar Mediclaim Plus Policy?
+[cite_start]Example Answer: A grace period of thirty days is provided for premium payment after the due date to renew or continue the policy without losing continuity benefits. [cite: 44]
 
-ANALYSIS FRAMEWORK:
-1. **Eligibility Assessment**: Determine if the claim is covered under the policy based on provided claim details.
-2. **Coverage Limits**: Identify applicable limits, deductibles, and caps.
-3. **Coordination of Benefits**: Check for multiple insurance policies and calculate remaining amounts if applicable.
-4. **Exclusion Review**: Identify any policy exclusions that apply based on the claim.
-5. **Decision Logic**: Apply business rules to determine approval/denial based on policy context and claim details.
-6. **Payout Calculation**: Calculate exact amounts considering all factors (limits, deductibles, primary payments).
+Example Question: What is the waiting period for pre-existing diseases (PED) to be covered?
+[cite_start]Example Answer: There is a waiting period of thirty-six (36) months of continuous coverage from the first policy inception for pre-existing diseases and their direct complications to be covered. [cite: 369]
 
-RESPONSE FORMAT (MUST BE VALID JSON - ensure all fields are present or null/empty array as appropriate):
-{{
-    "decision": "[APPROVED/DENIED/PENDING_REVIEW]",
-    "confidence_score": [0.0-1.0],
-    "payout_amount": [amount or null],
-    "reasoning": "A concise and direct answer to the Claim Question, summarizing the key information from the policy and incorporating Claim Details.",
-    "policy_sections_referenced": ["section_name_or_clause_number (Document: filename.pdf, Page X)", "another_section (Document: filename.docx, Page Y)"],
-    "exclusions_applied": ["exclusion_clause_or_name (Document: filename.pdf, Page Z)", "another_exclusion"],
-    "coordination_of_benefits": {{
-        "has_other_insurance": [true/false],
-        "primary_insurance": "name or null",
-        "secondary_insurance": "name or null",
-        "primary_payment": [amount or null],
-        "remaining_amount": [amount or null]
-    }},
-    "processing_notes": ["note1", "note2"]
-}}
+Example Question: Does this policy cover maternity expenses, and what are the conditions?
+Example Answer: Yes, the policy covers maternity expenses, including childbirth and lawful medical termination of pregnancy. To be eligible, the female insured person must have been continuously covered for at least 24 months. The benefit is limited to two deliveries or terminations during the policy period.
 
-IMPORTANT RULES:
-- Base decisions ONLY on information in the "Policy Context" and "Claim Details".
-- For coordination of benefits, if 'has_other_insurance' is true, assume 'primary_payment' is the amount already paid by primary insurer. Calculate 'remaining_amount' from the 'requested_amount' and policy limits, considering the 'primary_payment'. If 'requested_amount' is not provided, 'payout_amount' and 'remaining_amount' should be null.
-- Include 'confidence_score' based on clarity of policy language and completeness of claim details.
-- **VERY IMPORTANT: For 'policy_sections_referenced' and 'exclusions_applied', you MUST reference specific policy sections (e.g., 'Section A', 'Clause 3.1') AND the original document/page information (e.g., 'Document: policy.pdf, Page 3') that was present in the retrieved context.** Extract these details directly from the source document metadata if possible.
-- If information is unclear, ambiguous, or missing for a conclusive decision, use "PENDING_REVIEW" decision and explain why in 'reasoning' and 'processing_notes'.
-- The 'reasoning' field MUST contain the direct answer to the 'Claim Question', formatted clearly and concisely.
-- Ensure the output is a single, perfectly valid JSON object. Do not include any text before or after the JSON.
+Example Question: What is the waiting period for cataract surgery?
+[cite_start]Example Answer: The policy has a specific waiting period of two (2) years for cataract surgery. [cite: 371, 387]
 
-Policy Context:
+Example Question: Are the medical expenses for an organ donor covered under this policy?
+[cite_start]Example Answer: Yes, the policy indemnifies the medical expenses for the organ donor's hospitalization for the purpose of harvesting the organ, provided the organ is for an insured person and the donation complies with the Transplantation of Human Organs Act, 1994. [cite: 201, 202]
+
+Example Question: What is the No Claim Discount (NCD) offered in this policy?
+Example Answer: A No Claim Discount of 5% on the base premium is offered on renewal for a one-year policy term if no claims were made in the preceding year. [cite_start]The maximum aggregate NCD is capped at 5% of the total base premium. [cite: 637, 638, 639]
+
+Example Question: Is there a benefit for preventive health check-ups?
+Example Answer: Yes, the policy reimburses expenses for health check-ups at the end of every block of two continuous policy years, provided the policy has been renewed without a break. [cite_start]The amount is subject to the limits specified in the Table of Benefits. [cite: 204]
+
+Example Question: How does the policy define a 'Hospital'?
+[cite_start]Example Answer: A hospital is defined as an institution with at least 10 inpatient beds (in towns with a population below ten lakhs) or 15 beds (in all other places), with qualified nursing staff and medical practitioners available 24/7, a fully equipped operation theatre, and which maintains daily records of patients. [cite: 45, 46, 47, 48]
+
+Example Question: What is the extent of coverage for AYUSH treatments?
+[cite_start]Example Answer: The policy covers medical expenses for inpatient treatment under Ayurveda, Yoga, Naturopathy, Unani, Siddha, and Homeopathy systems up to the Sum Insured limit, provided the treatment is taken in an AYUSH Hospital. [cite: 207, 407]
+
+Example Question: Are there any sub-limits on room rent and ICU charges for Plan A?
+Example Answer: For Domestic Cover, Room rent and Boarding expenses are covered without any sub-limit. [cite_start]ICU expenses are paid up to actual ICU expenses provided by the Hospital. [cite: 184, 185]
+
+Example Question: What is the age limit for an Insured Person?
+[cite_start]Example Answer: An Insured Person must be between 3 months and 65 years of age at the commencement of the first Global Health Care Policy. [cite: 142]
+
+Example Question: How many days of pre-hospitalization medical expenses are covered?
+[cite_start]Example Answer: Medical Expenses incurred during the 60 days immediately before hospitalization are covered, provided they are for the same condition for which subsequent hospitalization was required and the inpatient claim is accepted. [cite: 190]
+
+Example Question: How many days of post-hospitalization medical expenses are covered?
+[cite_start]Example Answer: Medical expenses incurred during the 180 days immediately after discharge from hospitalization are covered, provided they are for the same condition for which earlier hospitalization was required and the inpatient claim is accepted. [cite: 196]
+
+Example Question: What is the maximum reimbursement for local road ambulance?
+Example Answer: The policy will pay the reasonable cost, specified in the Policy Schedule, for local road ambulance. [cite_start]Claims are payable only if the life-threatening emergency condition is certified by a Medical Practitioner and an Inpatient Hospitalization or Day Care Procedures claim is accepted. [cite: 197, 198, 199]
+
+Example Question: Does the policy cover Mental Illness Treatment, and what are its exclusions?
+Example Answer: Yes, the policy covers Customary and Reasonable expenses for In-patient treatment of Mental Illness (as specified under Annexure IV) in a recognized psychiatric unit of a Hospital, up to the Sum Insured. [cite_start]Exclusions include expenses related to Alcoholism, drug or substance abuse, diagnostic tests without psychiatrist advice, alternate treatments other than Allopathic, autism spectrum disorder admissions at specialized educational facilities, and Out-patient Treatment. [cite: 218, 222, 223, 224]
+
+Example Question: What is the definition of a Pre-Existing Disease (PED)?
+[cite_start]Example Answer: A Pre-Existing Disease is any condition, ailment, injury or disease diagnosed by a physician or for which medical advice/treatment was recommended/received within 48 months prior to the effective date of the policy or its reinstatement. [cite: 87, 88]
+
+Example Question: What is a 'Day Care Treatment'?
+Example Answer: Day care treatment means medical and/or surgical procedures undertaken under General or Local Anesthesia in a Hospital/Day Care Centre in less than 24 hours due to technological advancement, which would otherwise require over 24 hours of hospitalization. [cite_start]Out-patient basis treatment is excluded. [cite: 33, 34, 35]
+
+Example Question: Is there a co-payment for Dental Plan Benefits for international cover?
+[cite_start]Example Answer: Yes, there is a mandatory Co-Payment of 20% on each and every claim under Dental Plan Benefits for international cover. [cite: 347]
+
+Example Question: What is the claim settlement period for domestic cover?
+Example Answer: The Company shall settle or reject a claim within 30 days from the date of receipt of the last necessary document. [cite_start]In cases requiring investigation, the period extends to 45 days. [cite: 553, 554]
+
+Example Question: What happens if there's a delay in claim payment for domestic cover?
+[cite_start]Example Answer: In case of delay in payment of a claim, the Company is liable to pay interest to the Policyholder at a rate 2% above the bank rate from the date of receipt of the last necessary document to the date of claim payment. [cite: 554, 555]
+
+Example Question: What is the policy on 'Multiple Policies'?
+Example Answer: If an Insured has multiple policies from the same or different insurers, they have the right to choose which policy to claim from. [cite_start]If the Sum Insured of a single policy is exhausted, they can claim the balance from another policy, subject to its terms and conditions. [cite: 557, 558]
+
+Example Question: Under what conditions can the company cancel the policy?
+Example Answer: The Company may cancel the policy at any time on grounds of misrepresentation, non-disclosure of material facts, or fraud by the insured person, by giving 15 days' written notice. [cite_start]In such cases, there would be no refund of premium. [cite: 572]
+
+Example Question: What is the maximum sum insured for Air Ambulance under Imperial Plan?
+[cite_start]Example Answer: For the Imperial Plan, Air Ambulance expenses are reimbursed up to INR 500,000. [cite: 239]
+
+Example Question: Are diagnostic tests covered under Out-patient Treatment for International Cover (Imperial Plus Plan)?
+[cite_start]Example Answer: Yes, Diagnostic tests are covered under Out-patient Treatment for International Cover (Imperial Plus Plan) up to the limits specified in the Policy Schedule. [cite: 337]
+
+Example Question: What defines a "Network Provider"?
+[cite_start]Example Answer: A Network Provider means Hospitals or healthcare providers enlisted by the insurer, TPA, or jointly by an Insurer and TPA to provide medical services to an Insured by a Cashless Facility. [cite: 77]
+
+Example Question: What is the maximum percentage of sum insured for ICU expenses under Hospitalization for Domestic Cover?
+Example Answer: Intensive Care Unit (ICU) expenses are covered up to 5% of the Sum Insured, subject to a maximum of Rs. [cite_start]10,000 per day. [cite: 1697]
+
+Example Question: Are Dental Treatment and Surgery covered under Domestic Cover?
+Example Answer: Dental treatment is covered if necessitated due to disease or injury. [cite_start]Dental cosmetic surgery, dentures, dental prosthesis, dental implants, orthodontics, surgery of any kind are excluded unless as a result of Accidental Bodily Injury to natural teeth and requiring Hospitalization. [cite: 419, 431]
+
+Example Question: What are the primary details that should be in a medical practitioner's prescription?
+[cite_start]Example Answer: A medical practitioner's prescription should name the Insured Person and, for drugs, specify the drugs prescribed, their price, and include a receipt for payment. [cite: 1649]
+
+Example Question: What is the definition of "Accident"?
+[cite_start]Example Answer: An Accident means a sudden, unforeseen and involuntary event caused by external, visible and violent means. [cite: 7]
+
+Example Question: What is "Any one Illness"?
+[cite_start]Example Answer: Any one Illness means a continuous Period of Illness and it includes relapse within 45 days from the date of last consultation with the Hospital/Nursing Home where treatment was taken. [cite: 8]
+
+Example Question: How much is the daily allowance for choosing shared accommodation under HDFC ERGO Easy Health Individual Exclusive Plan for Rs. 500000 Sum Insured?
+Example Answer: For the Easy Health Individual Exclusive Plan with a Sum Insured of Rs. 500,000, the daily cash for choosing shared accommodation is Rs. 800 per day, with a maximum of Rs. [cite_start]4,800. [cite: 1655]
+
+Example Question: Does the Cholamandalam MS Group Domestic Travel Insurance cover any pre-existing conditions?
+Example Answer: This policy is not designed to provide an indemnity with respect to medical services the need for which arises out of a pre-existing condition as defined in the policy in normal course of treatment. [cite_start]However in any of the threatening situation this exclusion shall not be applied and also that the cover will up to the limit shown under Life threatening condition/ situation as defined in this policy. [cite: 1036]
+
+Example Question: What is the entry age for members under the Cholamandalam MS Group Domestic Travel Insurance?
+[cite_start]Example Answer: Entry age for the member should be between 03 months to 90 years (completed age). [cite: 967]
+
+Example Question: Is physiotherapy covered under HDFC ERGO Easy Health Domestic Plan?
+[cite_start]Example Answer: Yes, physiotherapy is covered under Pre-Hospitalization Medical Expenses and Post-Hospitalization Medical Expenses if prescribed by a Medical Practitioner and is Medically Necessary Treatment. [cite: 1630]
+
+Example Question: What is the grace period for renewal of National Arogya Sanjeevani Policy?
+Example Answer: The Grace Period for payment of the premium shall be thirty days. [cite_start]In case of Renewal, Coverage shall not be available during the period for which no premium is received. [cite: 1694]
+
+Example Question: Are spectacles and contact lenses covered under HDFC ERGO Easy Health policy?
+[cite_start]Example Answer: No, the provision or fitting of hearing aids, spectacles or contact lenses including optometric therapy are excluded. [cite: 1640]
+
+Example Question: What is the maximum liability for Air Ambulance under Edelweiss Well Baby Well Mother add-on?
+Example Answer: The maximum liability under this benefit for any and all claims arising during the Policy Year will be restricted to the Sum insured as stated in the Policy Schedule. The maximum distance of travel undertaken is 150 kms. [cite_start]In case of distance travelled is more than 150 kms, proportionate amount of expenses upto 150 kms shall be payable. [cite: 1620]
+
+Example Question: Is medical error covered under Bajaj Allianz Global Health Care policy?
+[cite_start]Example Answer: No, treatment required as a result of medical error is excluded. [cite: 440]
+
+END EXAMPLES
+
+Context:
 {context}
 
-Claim Details (Structured, if available):
-{claim_details_json}
-
-Claim Question: {question}
-
-Insurance Analysis (JSON format only):
+Question: {question}
+Answer:
 """
-CUSTOM_CLAIM_PROMPT = PromptTemplate(template=INSURANCE_CLAIM_PROMPT, input_variables=["context", "claim_details_json", "question"])
-
-
-# Prompt for LLM Parser to extract structured details from natural language query
-LLM_PARSER_PROMPT = """
-You are an AI assistant designed to extract key claim details from natural language queries.
-Your goal is to parse the user's question and identify structured information relevant to an insurance claim.
-
-Extract the following details if mentioned or inferable:
-- 'patient_age' (integer)
-- 'procedure' (string)
-- 'location' (string)
-- 'policy_duration_months' (integer, infer from phrases like '3-month-old policy', 'policy for X months')
-- 'requested_amount' (float, from phrases like '$X', 'Y USD', 'Z rupees')
-- 'has_other_insurance' (boolean: true if phrases like 'other insurance', 'secondary claim', 'already paid by primary' are present, else false)
-- 'primary_insurance_payment' (float, if a specific amount paid by primary insurer is mentioned, e.g., '$X paid by primary')
-
-Return the extracted details in JSON format. If a detail is not found or cannot be inferred, omit it from the JSON.
-Ensure the output is a single, perfectly valid JSON object. Do not include any text before or after the JSON.
-
-Example Input: "46-year-old male, knee surgery in Pune, 3-month-old insurance policy, seeking $25,000, with $10,000 paid by primary insurance"
-Example Output:
-{{
-  "patient_age": 46,
-  "procedure": "knee surgery",
-  "location": "Pune",
-  "policy_duration_months": 3,
-  "requested_amount": 25000.0,
-  "has_other_insurance": true,
-  "primary_insurance_payment": 10000.0
-}}
-
-Query: {query}
-
-Extracted Claim Details (JSON format only):
-"""
-CUSTOM_PARSER_PROMPT = PromptTemplate(template=LLM_PARSER_PROMPT, input_variables=["query"])
+CUSTOM_PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
 
 
 # --- API Authentication Dependency ---
@@ -161,33 +210,12 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
     return credentials.credentials
 
 # --- Pydantic Models for API Request/Response ---
-
-# Nested models for the structured JSON response
-class CoordinationOfBenefits(BaseModel):
-    has_other_insurance: bool = Field(False, description="True if other insurance policies are involved.")
-    primary_insurance: Optional[str] = Field(None, description="Name of the primary insurer, if applicable.")
-    secondary_insurance: Optional[str] = Field(None, description="Name of the secondary insurer, if applicable.")
-    primary_payment: Optional[float] = Field(None, description="Amount paid by the primary insurer, if applicable.")
-    remaining_amount: Optional[float] = Field(None, description="Remaining amount after primary payment and policy limits.")
-
-class ClaimResponseDetail(BaseModel):
-    decision: str = Field(..., description="Decision on the claim (APPROVED/DENIED/PENDING_REVIEW).")
-    confidence_score: float = Field(..., ge=0.0, le=1.0, description="Confidence in the decision (0.0 to 1.0).")
-    payout_amount: Optional[float] = Field(None, description="Calculated payout amount, if applicable.")
-    reasoning: str = Field(..., description="Concise justification for the decision, including key policy information.")
-    policy_sections_referenced: List[str] = Field([], description="List of specific policy sections/pages referenced.")
-    exclusions_applied: List[str] = Field([], description="List of exclusions applied, if any.")
-    coordination_of_benefits: CoordinationOfBenefits = Field(
-        default_factory=CoordinationOfBenefits, description="Details regarding coordination of benefits."
-    )
-    processing_notes: List[str] = Field([], description="Any additional notes during processing.")
-
 class QueryRequest(BaseModel):
     documents: Optional[str] = None # URL to a PDF, Word doc, or other supported type
     questions: List[str]
 
 class QueryResponse(BaseModel):
-    answers: List[ClaimResponseDetail] # Now a list of structured claim response details
+    answers: List[str] # List of strings, as desired
 
 # --- Helper function for dynamic document loading ---
 async def _fetch_and_load_document_from_url(url: str):
@@ -212,11 +240,9 @@ async def _fetch_and_load_document_from_url(url: str):
                 f.write(chunk)
         print(f"Document saved temporarily: {temp_file_path}")
 
-        # Langchain loaders add metadata like 'page' and 'source'
         if file_extension == "pdf":
             loader = PyPDFLoader(str(temp_file_path))
         elif file_extension in ["doc", "docx"]:
-            # Unstructured loaders can be heavy; ensure it's installed if needed
             loader = UnstructuredWordDocumentLoader(str(temp_file_path))
         else:
             raise ValueError(f"Unsupported document type from URL: {file_extension}. Only PDF, DOC, DOCX are supported.")
@@ -232,81 +258,18 @@ async def _fetch_and_load_document_from_url(url: str):
         print(f"ERROR: Failed to load document from {temp_file_path}: {e}")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Error processing document from URL: {e}")
 
-# --- Helper function for robust JSON parsing from LLM output ---
-def _parse_llm_json_output(text: str) -> Dict[str, Any]:
-    """
-    Attempts to robustly parse JSON output from an LLM,
-    handling common issues like leading/trailing text or markdown blocks.
-    """
-    # Try to find a JSON block in the text (e.g., ```json...``` or just { ... })
-    match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-    if match:
-        json_str = match.group(1)
-    else:
-        json_str = text.strip()
-
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError as e:
-        print(f"WARNING: Failed to decode JSON from LLM output: {e}")
-        print(f"LLM output that caused error:\n{text}")
-        # Fallback to attempt repair if common issues exist
-        try:
-            # Try to fix common issues: adding missing brackets, removing trailing commas
-            if not json_str.startswith('{'):
-                json_str = '{' + json_str
-            if not json_str.endswith('}'):
-                json_str = json_str + '}'
-            # Attempt a more lenient parse (though not always reliable)
-            # This is a basic attempt; for production, consider a more robust JSON repair library
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            raise ValueError(f"LLM output is not valid JSON and could not be repaired: {text}")
-
-# --- Helper function to parse claim details ---
-async def _parse_claim_details(query: str) -> Dict[str, Any]:
-    """
-    Uses an LLM to parse natural language claim query into structured details.
-    """
-    if llm_parser_model is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="LLM Parser model not initialized.")
-    
-    # Create the prompt for the parser LLM
-    parser_prompt_value = CUSTOM_PARSER_PROMPT.format_prompt(query=query)
-    
-    try:
-        # Invoke the parser LLM
-        response = llm_parser_model.invoke(parser_prompt_value.to_string())
-        # Parse the JSON output
-        parsed_details = _parse_llm_json_output(response.content)
-        print(f"Parsed Claim Details: {parsed_details}")
-        return parsed_details
-    except Exception as e:
-        print(f"ERROR: Failed to parse claim details with LLM: {e}")
-        return {"processing_notes": [f"Failed to parse claim details: {e}"]}
-
 
 # --- Application Startup Event (for default policy.pdf) ---
 @app.on_event("startup")
 async def startup_event():
     """
     Initializes the RAG components for the default 'policy.pdf'
-    and the LLM Parser model once when the FastAPI application starts.
+    once when the FastAPI application starts.
     """
-    global default_qa_chain, default_vector_store, llm_parser_model
+    global default_qa_chain, default_vector_store
 
-    print("--- Application Startup: Initializing RAG System ---")
+    print("--- Application Startup: Initializing RAG System with default policy.pdf ---")
 
-    # Initialize the LLM for parsing claim details (always needed)
-    try:
-        llm_parser_model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.1, google_api_key=GOOGLE_API_KEY)
-        print("LLM Parser model initialized.")
-    except Exception as e:
-        print(f"ERROR: Failed to initialize LLM Parser model: {e}")
-        # Re-raise to prevent app from starting if critical component fails
-        raise
-
-    # Initialize RAG for default policy.pdf (optional, allows dynamic loading if missing)
     if not os.path.exists(PDF_PATH):
         print(f"WARNING: Default '{PDF_PATH}' not found. The API will only work if documents are provided via URL in requests.")
         return
@@ -331,22 +294,19 @@ async def startup_event():
         default_vector_store = FAISS.from_documents(docs, embeddings)
         print("Default FAISS vector store built successfully.")
 
-        # Main LLM for claim analysis
-        main_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.2, google_api_key=GOOGLE_API_KEY)
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0) # Lower temperature for factual answers
         
         default_qa_chain = RetrievalQA.from_chain_type(
-            llm=main_llm,
+            llm=llm,
             chain_type="stuff",
-            retriever=default_vector_store.as_retriever(search_kwargs={"k": 8}), # Increased k for more context
-            return_source_documents=True, # Essential to get metadata for policy_sections_referenced
-            chain_type_kwargs={"prompt": CUSTOM_CLAIM_PROMPT}
+            retriever=default_vector_store.as_retriever(search_kwargs={"k": 5}), # Using k=5, can be tuned
+            chain_type_kwargs={"prompt": CUSTOM_PROMPT} # Apply custom prompt here
         )
         print("Default RetrievalQA chain initialized. API is ready to receive requests.")
 
     except Exception as e:
         print(f"--- ERROR during Default RAG System Initialization: {e} ---")
         print("Please ensure your GOOGLE_API_KEY is correct, 'policy.pdf' exists, and all required packages (like faiss-cpu) are installed.")
-        # Do not re-raise here if we want to allow dynamic document handling to proceed
 
 
 # --- API Endpoint ---
@@ -354,12 +314,12 @@ async def startup_event():
     "/hackrx/run",
     response_model=QueryResponse,
     dependencies=[Depends(verify_token)],
-    summary="Run LLM-Powered Claim Processing on Policy Documents"
+    summary="Run LLM-Powered Query-Retrieval on Policy Documents"
 )
 async def run_submission(request_body: QueryRequest):
     """
-    Processes a list of natural language questions as insurance claims against the provided document(s) (URL or default)
-    and returns structured claim decisions.
+    Processes a list of natural language questions against the provided document(s) (URL or default)
+    and returns contextual answers.
     """
     current_vector_store = None
     current_qa_chain = None
@@ -368,13 +328,8 @@ async def run_submission(request_body: QueryRequest):
     print(f"\n--- Received API Request ---")
     print(f"Questions: {request_body.questions}")
 
-    if llm_parser_model is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="LLM Parser is not initialized.")
     if FAISS is None:
-        # If FAISS never imported, cannot proceed with any vector store ops
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed. Cannot perform RAG operations.")
-
-    answers: List[ClaimResponseDetail] = []
 
     try:
         # Determine which document source to use
@@ -390,14 +345,13 @@ async def run_submission(request_body: QueryRequest):
             current_vector_store = FAISS.from_documents(docs, embeddings)
             print("FAISS vector store built for dynamic document.")
 
-            main_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.2, google_api_key=GOOGLE_API_KEY)
+            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0)
             
             current_qa_chain = RetrievalQA.from_chain_type(
-                llm=main_llm,
+                llm=llm,
                 chain_type="stuff",
-                retriever=current_vector_store.as_retriever(search_kwargs={"k": 8}), # Increased k
-                return_source_documents=True, # Crucial for metadata
-                chain_type_kwargs={"prompt": CUSTOM_CLAIM_PROMPT}
+                retriever=current_vector_store.as_retriever(search_kwargs={"k": 5}), # Using k=5
+                chain_type_kwargs={"prompt": CUSTOM_PROMPT}
             )
             print("RetrievalQA chain initialized for dynamic document.")
 
@@ -410,115 +364,21 @@ async def run_submission(request_body: QueryRequest):
                 )
             current_qa_chain = default_qa_chain
 
+        answers = []
         for question in request_body.questions:
-            print(f"\nProcessing Claim Question: '{question}'")
-            
-            # Step 1: Parse the natural language query into structured claim details
-            claim_details = await _parse_claim_details(question)
-            claim_details_json_str = json.dumps(claim_details, indent=2)
-
-            # Step 2: Invoke the main RAG chain with the structured claim details and original question
-            # The 'query' for RetrievalQA will be the original question,
-            # and the `CUSTOM_CLAIM_PROMPT` will inject the structured details and context.
+            print(f"Processing question: '{question}'")
             try:
-                # result = current_qa_chain.invoke({"query": question})
-                # The .run() method takes string arguments directly for simple chains.
-                # For complex prompts with multiple input variables, we need to use _call or invoke
-                # For RetrievalQA, 'query' is usually the question.
-                # We format the prompt inputs manually to ensure `claim_details_json` is passed.
-                
-                # RetrievalQA.invoke returns {"query": ..., "result": ..., "source_documents": [...]}
-                # We need the source_documents for referencing, so we use invoke.
-                
-                # Fetch relevant docs for the context
-                retrieved_docs = current_qa_chain.retriever.get_relevant_documents(question)
-                context_str = "\n\n".join([doc.page_content for doc in retrieved_docs])
+                result = current_qa_chain.invoke({"query": question})
+                answers.append(result.get("result", "Could not retrieve an answer based on the provided documents."))
+            except Exception as qa_e:
+                print(f"ERROR: Failed to process question '{question}' with RAG chain: {qa_e}")
+                answers.append(f"An error occurred while processing this question: {qa_e}")
+            print(f"Answer generated for '{question}'.")
 
-                # Prepare inputs for the custom prompt
-                formatted_prompt = CUSTOM_CLAIM_PROMPT.format(
-                    context=context_str,
-                    claim_details_json=claim_details_json_str,
-                    question=question
-                )
-                
-                # Directly invoke the LLM with the fully formatted prompt
-                # Note: RetrievalQA.from_chain_type with chain_type="stuff" typically handles this,
-                # but if we need full control over prompt structure including retrieved docs
-                # AND external variables like claim_details_json, direct LLM call is cleaner.
-                # Let's stick to the structure of RetrievalQA but ensure custom prompt handles it.
-                # If RetrievalQA setup isn't robust enough for external variables + context,
-                # we'd switch to a custom chain or direct LLM.
-                
-                # Re-configuring RetrievalQA to use multiple inputs requires a different chain type or custom chain.
-                # For simplicity and to use the `retriever` component properly, we will modify the prompt slightly.
-                # The 'context' is automatically provided by RetrievalQA.
-                # We'll pass `claim_details_json` as part of the `query` or rely on the LLM to understand.
-                # A better way for multiple inputs is using `RunnableParallel` with `LCEL` or custom chain.
-                # For hackathon quick solution, we pass claim_details_json as part of question.
-                
-                # Let's simplify the RetrievalQA usage for now and assume the LLM can handle the JSON in the prompt
-                # without requiring it as a separate `input_variable` to RetrievalQA itself.
-                # The context comes from retriever, question is the query. We'll inject claim_details_json into prompt template.
-                
-                # The correct way to pass `claim_details_json` is through the chain_type_kwargs
-                # which is already set for CUSTOM_CLAIM_PROMPT. So, the original `qa_chain.invoke` should work.
-                
-                result = current_qa_chain.invoke({
-                    "query": question, # This goes into {question} in prompt
-                    "claim_details_json": claim_details_json_str # This goes into {claim_details_json} in prompt
-                })
-
-                llm_raw_output = result.get("result", "")
-                
-                # Extract policy sections and exclusions from source documents
-                policy_sections = []
-                exclusions_applied = []
-                source_documents = result.get("source_documents", [])
-                
-                for doc in source_documents:
-                    source_str = f"Document: {Path(doc.metadata.get('source', 'unknown_doc')).name}"
-                    if 'page' in doc.metadata:
-                        source_str += f", Page {doc.metadata['page'] + 1}" # Page numbers are often 0-indexed
-                    
-                    # This is a basic attempt. LLM might reference clause numbers from text directly.
-                    # We assume LLM explicitly calls out "Section X", "Clause Y" etc. in its reasoning
-                    # and we just append the document source to every retrieved document.
-                    # More sophisticated parsing of LLM's 'reasoning' to map specific clauses needed for full automation.
-                    policy_sections.append(source_str)
-                    # For exclusions, a more advanced regex on reasoning might be needed to identify if an exclusion was applied.
-                    # For now, we'll assume the LLM will explicitly name exclusions in reasoning.
-
-                # Parse the LLM's structured JSON output
-                parsed_response_dict = _parse_llm_json_output(llm_raw_output)
-
-                # Fill in source documents if LLM didn't (or refine if LLM did)
-                if not parsed_response_dict.get("policy_sections_referenced"):
-                    parsed_response_dict["policy_sections_referenced"] = list(set(policy_sections)) # Deduplicate
-                
-                # Attempt to parse into Pydantic model
-                claim_response = ClaimResponseDetail(**parsed_response_dict)
-                
-            except Exception as e:
-                print(f"ERROR: Failed to process claim with RAG chain or parse LLM output: {e}")
-                # Create a fallback error response
-                claim_response = ClaimResponseDetail(
-                    decision="PENDING_REVIEW",
-                    confidence_score=0.0,
-                    payout_amount=None,
-                    reasoning=f"Failed to process claim due to internal error: {e}",
-                    policy_sections_referenced=[],
-                    exclusions_applied=[],
-                    coordination_of_benefits=CoordinationOfBenefits(has_other_insurance=False),
-                    processing_notes=[f"Error during main claim processing: {e}"]
-                )
-            answers.append(claim_response)
-            print(f"Claim response generated for '{question}'.")
-
-        print("--- All questions processed. Sending structured response. ---")
+        print("--- All questions processed. Sending response. ---")
         return {"answers": answers}
 
     except HTTPException:
-        # Re-raise HTTPExceptions directly as they are already formatted
         raise
     except Exception as e:
         print(f"ERROR: An unexpected error occurred during overall query processing: {e}")
@@ -527,12 +387,11 @@ async def run_submission(request_body: QueryRequest):
             detail=f"An internal server error occurred: {e}"
         )
     finally:
-        # Clean up temporary document if one was downloaded
         if temp_doc_path and temp_doc_path.exists():
             try:
                 os.remove(temp_doc_path)
                 print(f"Cleaned up temporary file: {temp_doc_path}")
-                if not any(Path("./temp_docs").iterdir()): # Remove dir if empty
+                if Path("./temp_docs").exists() and not any(Path("./temp_docs").iterdir()):
                     os.rmdir("./temp_docs")
             except Exception as cleanup_e:
                 print(f"WARNING: Failed to clean up temporary file {temp_doc_path}: {cleanup_e}")
@@ -543,4 +402,4 @@ def root():
     """
     Root endpoint to check if the API is running.
     """
-    return {"message": "LLM-Powered Intelligent Claim Processing System API is running. Visit /api/v1/docs for interactive documentation."}
+    return {"message": "LLM-Powered Intelligent Query–Retrieval System API is running. Visit /api/v1/docs for interactive documentation."}
