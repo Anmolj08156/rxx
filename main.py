@@ -186,8 +186,3 @@ def root():
     """
     return {"message": "LLM-Powered Intelligent Query–Retrieval System API is running. Visit /api/v1/docs for interactive documentation."}
 
-This updated code ensures that your `API_BEARER_TOKEN` and `GOOGLE_API_KEY` are strictly sourced from environment variables, which is the correct way to handle them in production. You will need to set both `API_BEARER_TOKEN` and `GOOGLE_API_KEY` in your Render environment variables for the application to start successfully.
-
-[How to Configure Environment Variables in Render](https://www.youtube.com/watch?v=TI1jU2YbIPA)
-This video explains how to work with environment variables and configuration files in FastAPI, which is relevant for setting up your API key and bearer token in Render.
-http://googleusercontent.com/youtube_content/6
