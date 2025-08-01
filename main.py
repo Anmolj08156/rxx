@@ -1,29 +1,38 @@
 import os
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional
 
 # Langchain imports for RAG functionality
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import FAISS
+# Attempt to import FAISS, handle ImportError if not installed
+try:
+    from langchain_community.vectorstores import FAISS
+except ImportError:
+    FAISS = None # Set to None if import fails, handle this later
+    print("WARNING: FAISS package not found. Please install 'faiss-cpu' or 'faiss-gpu' to enable vector store functionality.")
+
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 
-# Load environment variables from .env file
+# Load environment variables from .env file (for local development)
 load_dotenv()
 
 # --- Configuration & Setup ---
-# Bearer token for API authentication as provided in the problem statement
-API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "6b330b572cbe55058f000377088af8082ea2e98c81de3606b6d4d8728c90166")
+
+# Retrieve API Bearer Token from environment variables
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
+if not API_BEARER_TOKEN:
+    raise ValueError("API_BEARER_TOKEN environment variable is not set. Please add it to your .env file or Render environment.")
 
 # Google API Key is essential for Google Gemini models
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable is not set. Please add it to your .env file.")
+    raise ValueError("GOOGLE_API_KEY environment variable is not set. Please add it to your .env file or Render environment.")
 
 # Define the path to the merged PDF document
 # This PDF is expected to be in the root of the project directory
@@ -86,31 +95,34 @@ async def startup_event():
         # or have a more robust way to handle missing documents.
         return
 
+    # 2. Check if FAISS is available before proceeding
+    if FAISS is None:
+        print("ERROR: FAISS is not installed. RAG system cannot be initialized.")
+        return
+
     try:
-        # 2. Load the document
+        # 3. Load the document
         print(f"Loading document from: {PDF_PATH}")
         loader = PyPDFLoader(PDF_PATH)
         documents = loader.load()
         print(f"Loaded {len(documents)} pages from {PDF_PATH}")
 
-        # 3. Split documents into chunks
+        # 4. Split documents into chunks
         print("Splitting documents into chunks...")
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         docs = text_splitter.split_documents(documents)
         print(f"Created {len(docs)} text chunks.")
 
-        # 4. Create embeddings and build FAISS vector store
+        # 5. Create embeddings and build FAISS vector store
         print("Creating embeddings and building FAISS vector store (this may take a moment)...")
-        # Ensure GOOGLE_API_KEY is passed for embeddings
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
         vector_store = FAISS.from_documents(docs, embeddings)
         print("FAISS vector store built successfully.")
 
-        # 5. Initialize the ChatGoogleGenerativeAI LLM
-        # Ensure GOOGLE_API_KEY is passed for the chat model
+        # 6. Initialize the ChatGoogleGenerativeAI LLM
         llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0, google_api_key=GOOGLE_API_KEY)
         
-        # 6. Create the RetrievalQA chain
+        # 7. Create the RetrievalQA chain
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff", # "stuff" combines all retrieved documents into one prompt
@@ -120,7 +132,7 @@ async def startup_event():
 
     except Exception as e:
         print(f"--- ERROR during RAG System Initialization: {e} ---")
-        print("Please ensure your GOOGLE_API_KEY is correct and 'policy.pdf' exists.")
+        print("Please ensure your GOOGLE_API_KEY is correct and 'policy.pdf' exists, and all required packages (like faiss-cpu) are installed.")
         # Optionally, re-raise the exception to prevent the server from starting if initialization fails
         # raise
 
@@ -142,7 +154,7 @@ async def run_submission(request_body: QueryRequest):
     if qa_chain is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="RAG system is not initialized. Please check server logs for startup errors."
+            detail="RAG system is not initialized. Please check server logs for startup errors or missing dependencies."
         )
 
     print(f"\n--- Received API Request ---")
@@ -152,9 +164,7 @@ async def run_submission(request_body: QueryRequest):
         answers = []
         for question in request_body.questions:
             print(f"Processing question: '{question}'")
-            # Invoke the QA chain with the user's question
             result = qa_chain.invoke({"query": question})
-            # The result from RetrievalQA.invoke is a dictionary, typically with a 'result' key
             answers.append(result.get("result", "Could not retrieve an answer."))
             print(f"Answer generated for '{question}'.")
 
@@ -176,3 +186,8 @@ def root():
     """
     return {"message": "LLM-Powered Intelligent Query–Retrieval System API is running. Visit /api/v1/docs for interactive documentation."}
 
+This updated code ensures that your `API_BEARER_TOKEN` and `GOOGLE_API_KEY` are strictly sourced from environment variables, which is the correct way to handle them in production. You will need to set both `API_BEARER_TOKEN` and `GOOGLE_API_KEY` in your Render environment variables for the application to start successfully.
+
+[How to Configure Environment Variables in Render](https://www.youtube.com/watch?v=TI1jU2YbIPA)
+This video explains how to work with environment variables and configuration files in FastAPI, which is relevant for setting up your API key and bearer token in Render.
+http://googleusercontent.com/youtube_content/6
