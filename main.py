@@ -3,8 +3,8 @@ import requests
 from dotenv import load_dotenv
 import uuid
 from pathlib import Path
-import time
-import itertools
+import time # For retries
+import itertools # For cycling through API keys
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -21,16 +21,7 @@ except ImportError:
 
 # --- MISTRAL AI Imports ---
 from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
-# Try a more general import for the exception to avoid submodule issues
-try:
-    from mistralai.exceptions import MistralAPIException
-except ImportError:
-    # Fallback if mistralai.exceptions is not found directly
-    # In older versions or specific setups, it might be tied to the client object
-    # Or, as a last resort, catch a broader exception like requests.exceptions.RequestException
-    print("WARNING: Could not import MistralAPIException directly. Will try a general API exception catch.")
-    MistralAPIException = requests.exceptions.RequestException # Use a more general exception if specific one fails
-
+from mistralai.exceptions import MistralAPIException # Specific exception to catch for rate limits etc.
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
@@ -57,13 +48,16 @@ api_key_iterator = itertools.cycle(MISTRAL_API_KEYS)
 current_mistral_api_key = next(api_key_iterator)
 
 def get_next_api_key():
+    """Cycles to the next API key in the list."""
     global current_mistral_api_key
     current_mistral_api_key = next(api_key_iterator)
     print(f"Switched to next Mistral API Key. Current key (partial): {current_mistral_api_key[:5]}...")
     return current_mistral_api_key
 
+# Define the path to the merged PDF document (fallback/initial document)
 PDF_PATH = "policy.pdf"
 
+# --- FastAPI App Initialization ---
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Mistral AI)",
     description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains.",
@@ -72,10 +66,12 @@ app = FastAPI(
     redoc_url="/api/v1/redoc"
 )
 
+# --- Global RAG Chain Components ---
 default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
+last_used_api_key_for_default_chain: Optional[str] = None # NEW GLOBAL VARIABLE
 
-# --- Prompt Engineering (remains same) ---
+# --- Prompt Engineering with Extensive Few-Shot Examples (Sources Removed) ---
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
 Your task is to answer user queries accurately, concisely, and comprehensively, based **only** on the provided context.
@@ -426,7 +422,7 @@ async def run_submission(request_body: QueryRequest):
     and returns contextual answers.
     """
     # Declare global variables used in this function
-    global default_qa_chain, default_vector_store, current_mistral_api_key # Added current_mistral_api_key
+    global default_qa_chain, default_vector_store, current_mistral_api_key
 
     current_vector_store = None
     current_qa_chain = None
@@ -467,9 +463,8 @@ async def run_submission(request_body: QueryRequest):
                 else:
                     # For the default chain, if the key was just rotated, we need to rebuild it
                     # to ensure it uses the new key for its internal LLM and Embeddings.
-                    # This ensures the default_qa_chain's LLM uses the current key from rotation.
                     # Note: default_vector_store's embeddings are only set once at startup.
-                    if default_qa_chain is None or default_qa_chain.llm.mistral_api_key != current_mistral_api_key:
+                    if default_qa_chain is None or (default_qa_chain.llm and hasattr(default_qa_chain.llm, 'mistral_api_key') and default_qa_chain.llm.mistral_api_key != current_mistral_api_key):
                         print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
                         default_qa_chain = RetrievalQA.from_chain_type(
                             llm=llm, # Use the LLM initialized with current_mistral_api_key
