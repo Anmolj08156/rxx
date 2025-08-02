@@ -3,8 +3,8 @@ import requests
 from dotenv import load_dotenv
 import uuid
 from pathlib import Path
-import time # For retries
-import itertools # For cycling through API keys
+import time
+import itertools
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -21,7 +21,16 @@ except ImportError:
 
 # --- MISTRAL AI Imports ---
 from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
-from mistralai.exceptions import MistralAPIException # Specific exception to catch for rate limits etc.
+# CHANGE STARTS HERE
+try:
+    from mistralai.exceptions import MistralAPIException
+except ImportError:
+    # If mistralai.exceptions.MistralAPIException cannot be imported,
+    # fall back to catching the more general requests.exceptions.RequestException
+    # This ensures the code can run even if the specific exception class isn't found.
+    print("WARNING: Could not import mistralai.exceptions.MistralAPIException directly. Falling back to requests.exceptions.RequestException for error handling.")
+    MistralAPIException = requests.exceptions.RequestException
+# CHANGE ENDS HERE
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
@@ -48,16 +57,13 @@ api_key_iterator = itertools.cycle(MISTRAL_API_KEYS)
 current_mistral_api_key = next(api_key_iterator)
 
 def get_next_api_key():
-    """Cycles to the next API key in the list."""
     global current_mistral_api_key
     current_mistral_api_key = next(api_key_iterator)
     print(f"Switched to next Mistral API Key. Current key (partial): {current_mistral_api_key[:5]}...")
     return current_mistral_api_key
 
-# Define the path to the merged PDF document (fallback/initial document)
 PDF_PATH = "policy.pdf"
 
-# --- FastAPI App Initialization ---
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Mistral AI)",
     description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains.",
@@ -66,10 +72,9 @@ app = FastAPI(
     redoc_url="/api/v1/redoc"
 )
 
-# --- Global RAG Chain Components ---
 default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
-last_used_api_key_for_default_chain: Optional[str] = None # NEW GLOBAL VARIABLE
+
 
 # --- Prompt Engineering with Extensive Few-Shot Examples (Sources Removed) ---
 PROMPT_TEMPLATE = """
@@ -464,7 +469,7 @@ async def run_submission(request_body: QueryRequest):
                     # For the default chain, if the key was just rotated, we need to rebuild it
                     # to ensure it uses the new key for its internal LLM and Embeddings.
                     # Note: default_vector_store's embeddings are only set once at startup.
-                    if default_qa_chain is None or (default_qa_chain.llm and hasattr(default_qa_chain.llm, 'mistral_api_key') and default_qa_chain.llm.mistral_api_key != current_mistral_api_key):
+                    if default_qa_chain is None or (hasattr(default_qa_chain, 'llm') and hasattr(default_qa_chain.llm, 'mistral_api_key') and default_qa_chain.llm.mistral_api_key != current_mistral_api_key):
                         print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
                         default_qa_chain = RetrievalQA.from_chain_type(
                             llm=llm, # Use the LLM initialized with current_mistral_api_key
