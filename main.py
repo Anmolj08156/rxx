@@ -19,13 +19,15 @@ except ImportError:
     FAISS = None
     print("WARNING: FAISS package not found. Please install 'faiss-cpu' or 'faiss-gpu' to enable vector store functionality.")
 
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+# --- MISTRAL AI Imports ---
+from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
+# For specific error handling (MistralAIException is often caught by base Exception or directly by LangChain)
+# from mistralai.client import MistralClient # Not directly used for exceptions in LangChain integration
+from mistralai.exceptions import MistralAPIException # Specific exception to catch for rate limits etc.
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-
-# For handling specific Google API errors
-from google.api_core.exceptions import ResourceExhausted
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
@@ -36,40 +38,36 @@ API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 if not API_BEARER_TOKEN:
     raise ValueError("API_BEARER_TOKEN environment variable is not set. Please add it to your .env file or Render environment.")
 
-# Retrieve multiple Google API Keys from environment variable
+# Retrieve multiple Mistral API Keys from environment variable
 # Expects a comma-separated string of keys, e.g., "key1,key2,key3"
-GOOGLE_API_KEYS_STR = os.getenv("GOOGLE_API_KEYS") # Changed to GOOGLE_API_KEYS
-if not GOOGLE_API_KEYS_STR:
-    # Fallback to single key if GOOGLE_API_KEYS is not set, for backward compatibility
-    # but recommend using GOOGLE_API_KEYS for rotation.
-    single_key = os.getenv("GOOGLE_API_KEY")
-    if not single_key:
-        raise ValueError("GOOGLE_API_KEYS or GOOGLE_API_KEY environment variable is not set. Please add it to your .env file or Render environment.")
-    GOOGLE_API_KEYS = [single_key]
-else:
-    GOOGLE_API_KEYS = [k.strip() for k in GOOGLE_API_KEYS_STR.split(',')]
-    if not GOOGLE_API_KEYS: # Ensure list is not empty after splitting
-        raise ValueError("GOOGLE_API_KEYS environment variable is set but contains no valid keys.")
+MISTRAL_API_KEYS_STR = os.getenv("MISTRAL_API_KEYS") # CHANGED: Environment variable name
+if not MISTRAL_API_KEYS_STR:
+    raise ValueError("MISTRAL_API_KEYS environment variable is not set. Please add it to your .env file or Render environment.")
+
+MISTRAL_API_KEYS = [k.strip() for k in MISTRAL_API_KEYS_STR.split(',')]
+if not MISTRAL_API_KEYS: # Ensure list is not empty after splitting
+    raise ValueError("MISTRAL_API_KEYS environment variable is set but contains no valid keys.")
 
 # Global iterator for cycling through API keys
-# Using itertools.cycle to continuously loop through the keys
-api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
-current_google_api_key = next(api_key_iterator) # Initialize with the first key
+api_key_iterator = itertools.cycle(MISTRAL_API_KEYS)
+current_mistral_api_key = next(api_key_iterator) # Initialize with the first key
 
 def get_next_api_key():
     """Cycles to the next API key in the list."""
-    global current_google_api_key
-    current_google_api_key = next(api_key_iterator)
-    print(f"Switched to next Google API Key. Current key (partial): {current_google_api_key[:5]}...") # Print partial for security
-    return current_google_api_key
-
+    global current_mistral_api_key
+    current_mistral_api_key = next(api_key_iterator)
+    print(f"Switched to next Mistral API Key. Current key (partial): {current_mistral_api_key[:5]}...")
+    return current_mistral_api_key
 
 # Define the path to the merged PDF document (fallback/initial document)
+# IMPORTANT: If you upload a combined PDF to your GitHub repo,
+# ensure it's named 'policy.pdf' and placed in the root directory.
+# Otherwise, update this path to match your combined PDF's name.
 PDF_PATH = "policy.pdf"
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="LLM-Powered Intelligent Query–Retrieval System (Google Gemini)",
+    title="LLM-Powered Intelligent Query–Retrieval System (Mistral AI)", # CHANGED: Title
     description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains.",
     version="1.0.0",
     docs_url="/api/v1/docs",
@@ -375,7 +373,7 @@ async def startup_event():
     Initializes the RAG components for the default 'policy.pdf'
     once when the FastAPI application starts.
     """
-    global default_qa_chain, default_vector_store, current_google_api_key
+    global default_qa_chain, default_vector_store, current_mistral_api_key
 
     print("--- Application Startup: Initializing RAG System with default policy.pdf ---")
 
@@ -399,13 +397,13 @@ async def startup_event():
         print(f"Created {len(docs)} text chunks for default policy.")
 
         print("Creating embeddings and building default FAISS vector store (this may take a moment)...")
-        # Use the initial current_google_api_key for startup embeddings
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=current_google_api_key)
+        # CHANGED: Use MistralAIEmbeddings
+        embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
         default_vector_store = FAISS.from_documents(docs, embeddings)
         print("Default FAISS vector store built successfully.")
 
-        # Use the initial current_google_api_key for the default LLM
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0, google_api_key=current_google_api_key)
+        # CHANGED: Use ChatMistralAI
+        llm = ChatMistralAI(model="mistral-small-latest", temperature=0, mistral_api_key=current_mistral_api_key)
         
         default_qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
@@ -417,7 +415,7 @@ async def startup_event():
 
     except Exception as e:
         print(f"--- ERROR during Default RAG System Initialization: {e} ---")
-        print("Please ensure your GOOGLE_API_KEYS are correct, 'policy.pdf' exists, and all required packages (like faiss-cpu) are installed.")
+        print("Please ensure your MISTRAL_API_KEYS are correct, 'policy.pdf' exists, and all required packages (like faiss-cpu, langchain-mistralai) are installed.")
         # Do not raise here, allow the app to start to handle dynamic document uploads
 
 
@@ -446,27 +444,22 @@ async def run_submission(request_body: QueryRequest):
     answers = []
     
     # Retry logic for each question with API key rotation
-    max_retries = len(GOOGLE_API_KEYS) * 2 # Allow retrying with each key at least twice
+    max_retries = len(MISTRAL_API_KEYS) * 2 # Allow retrying with each key at least twice
     for question in request_body.questions:
         print(f"Processing question: '{question}'")
         attempt = 0
         answer_found = False
         while attempt < max_retries:
             try:
-                # IMPORTANT: For dynamic documents, we rebuild the chain. For default, we reuse.
-                # The LLM and Embeddings objects need to be re-initialized with the current_google_api_key
-                # if a quota error occurs and we rotate the key.
-                
-                # Re-initialize LLM and Embeddings with the current_google_api_key for each attempt/rotation
-                # This ensures the new key is used if it was rotated.
-                llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0, google_api_key=current_google_api_key)
-                embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=current_google_api_key)
+                # Re-initialize LLM and Embeddings with the current_mistral_api_key for each attempt/rotation
+                llm = ChatMistralAI(model="mistral-small-latest", temperature=0, mistral_api_key=current_mistral_api_key) # CHANGED
+                embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key) # CHANGED
 
                 if request_body.documents:
                     # Dynamic document handling: needs to re-fetch/re-process for each attempt if key changes
                     # This is inefficient but necessary for key rotation during dynamic loads.
                     # For production, consider caching dynamic vector stores.
-                    print(f"Re-initializing chain for dynamic document with key (partial): {current_google_api_key[:5]}...")
+                    print(f"Re-initializing chain for dynamic document with key (partial): {current_mistral_api_key[:5]}...")
                     documents, temp_doc_path = await _fetch_and_load_document_from_url(request_body.documents)
                     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
                     docs = text_splitter.split_documents(documents)
@@ -479,43 +472,44 @@ async def run_submission(request_body: QueryRequest):
                     )
                 else:
                     # Use the globally pre-initialized chain for default policy.pdf
-                    # Re-assign LLM to default_qa_chain's internal LLM to ensure key is updated
-                    if default_qa_chain is None:
-                        raise HTTPException(
-                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail="Default RAG system is not initialized. 'policy.pdf' might be missing or there were startup errors."
+                    # If key was rotated, we need to rebuild the default_qa_chain to use the new key
+                    if default_qa_chain is None or default_qa_chain.llm.mistral_api_key != current_mistral_api_key:
+                        print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
+                        # This re-initialization of default_qa_chain implies default_vector_store uses the first key.
+                        # For true embedding rotation for default, default_vector_store itself needs to be rebuilt too.
+                        # But embeddings are typically less rate-limited. So, just rebuilding LLM part for now.
+                        global default_qa_chain # Declare global to modify the global variable
+                        default_qa_chain = RetrievalQA.from_chain_type(
+                            llm=llm, # Use the LLM initialized with current_mistral_api_key
+                            chain_type="stuff",
+                            retriever=default_vector_store.as_retriever(search_kwargs={"k": 5}),
+                            chain_type_kwargs={"prompt": CUSTOM_PROMPT}
                         )
-                    # This part is tricky: Langchain's RetrievalQA doesn't easily let you swap LLMs mid-chain.
-                    # The safest way is to re-create the default_qa_chain if the key changes, or if using
-                    # default, ensure its internal LLM uses the current global API key if that was the issue.
-                    # For simplicity, if using the default chain, we just rely on its initial setup.
-                    # The error usually happens during model invocation, so changing the key for `llm` should suffice.
                     current_qa_chain = default_qa_chain
-                    # A more robust solution for default_qa_chain would be to rebuild it with the new key if a quota error happens for it.
-                    # For now, we assume the LLM object passed to the chain is what matters.
+
 
                 result = current_qa_chain.invoke({"query": question})
                 answers.append(result.get("result", "I cannot answer this question based on the provided documents."))
                 answer_found = True
                 break # Exit retry loop if successful
 
-            except ResourceExhausted as re_e:
+            except MistralAPIException as e: # CHANGED: Specific Mistral exception
                 attempt += 1
-                print(f"Quota error for current key (attempt {attempt}/{max_retries}): {re_e}")
+                print(f"Mistral API error for current key (attempt {attempt}/{max_retries}): {e}")
                 if attempt < max_retries:
                     get_next_api_key() # Rotate key
                     print("Retrying with new key after a short delay...")
                     time.sleep(5) # Small delay before retrying
                 else:
-                    print("All API keys exhausted or max retries reached. Failing this question.")
-                    answers.append(f"Could not retrieve an answer due to API quota limits being exceeded.")
+                    print("All Mistral API keys exhausted or max retries reached. Failing this question.")
+                    answers.append(f"Could not retrieve an answer due to Mistral API quota limits being exceeded.")
                     break # Exit retry loop, all keys exhausted for this question
             except Exception as e:
-                print(f"ERROR: Failed to process question '{question}' with RAG chain (non-quota error): {e}")
+                print(f"ERROR: Failed to process question '{question}' with RAG chain (non-Mistral API error): {e}")
                 answers.append(f"An unexpected error occurred: {e}")
                 answer_found = True # Treat as answered (with error message) to avoid infinite loop
                 break # Exit retry loop
-        
+            
         if not answer_found and attempt >= max_retries:
             # This case handles if all retries were exhausted specifically for quota and no answer was appended.
             answers.append(f"Failed to answer '{question}' after multiple retries due to persistent API quota limits.")
@@ -525,6 +519,14 @@ async def run_submission(request_body: QueryRequest):
     print("--- All questions processed. Sending response. ---")
     return {"answers": answers}
 
-    # The finally block outside the question loop will clean up temp files
-    # This might be an issue if an error occurs early and temp_doc_path is not set.
-    # The current placement inside the main try-except block and `finally` for the entire function is okay.
+# The finally block outside the question loop will clean up temp files
+# This might be an issue if an error occurs early and temp_doc_path is not set.
+# The current placement inside the main try-except block and `finally` for the entire function is okay.
+
+# --- Root Endpoint (Optional, for quick health check) ---
+@app.get("/", include_in_schema=False)
+def root():
+    """
+    Root endpoint to check if the API is running.
+    """
+    return {"message": "LLM-Powered Intelligent Query–Retrieval System API is running. Visit /api/v1/docs for interactive documentation."}
