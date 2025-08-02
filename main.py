@@ -431,6 +431,10 @@ async def run_submission(request_body: QueryRequest):
     Processes a list of natural language questions against the provided document(s) (URL or default)
     and returns contextual answers.
     """
+    global default_qa_chain, default_vector_store # ADD default_vector_store here if it's ever reassigned too
+    # It seems default_vector_store is only assigned once in startup, so it might not need 'global' here,
+    # but for clarity and safety, it's good to include all global components that might be touched.
+
     current_vector_store = None
     current_qa_chain = None
     temp_doc_path = None
@@ -452,18 +456,15 @@ async def run_submission(request_body: QueryRequest):
         while attempt < max_retries:
             try:
                 # Re-initialize LLM and Embeddings with the current_mistral_api_key for each attempt/rotation
-                llm = ChatMistralAI(model="mistral-small-latest", temperature=0, mistral_api_key=current_mistral_api_key) # CHANGED
-                embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key) # CHANGED
+                llm = ChatMistralAI(model="mistral-small-latest", temperature=0, mistral_api_key=current_mistral_api_key)
+                embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
 
                 if request_body.documents:
-                    # Dynamic document handling: needs to re-fetch/re-process for each attempt if key changes
-                    # This is inefficient but necessary for key rotation during dynamic loads.
-                    # For production, consider caching dynamic vector stores.
                     print(f"Re-initializing chain for dynamic document with key (partial): {current_mistral_api_key[:5]}...")
                     documents, temp_doc_path = await _fetch_and_load_document_from_url(request_body.documents)
                     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
                     docs = text_splitter.split_documents(documents)
-                    temp_vector_store = FAISS.from_documents(docs, embeddings) # Create new temp store
+                    temp_vector_store = FAISS.from_documents(docs, embeddings)
                     current_qa_chain = RetrievalQA.from_chain_type(
                         llm=llm,
                         chain_type="stuff",
@@ -473,12 +474,17 @@ async def run_submission(request_body: QueryRequest):
                 else:
                     # Use the globally pre-initialized chain for default policy.pdf
                     # If key was rotated, we need to rebuild the default_qa_chain to use the new key
+                    # default_qa_chain and default_vector_store are already declared global at function start
                     if default_qa_chain is None or default_qa_chain.llm.mistral_api_key != current_mistral_api_key:
                         print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
-                        # This re-initialization of default_qa_chain implies default_vector_store uses the first key.
-                        # For true embedding rotation for default, default_vector_store itself needs to be rebuilt too.
-                        # But embeddings are typically less rate-limited. So, just rebuilding LLM part for now.
-                        global default_qa_chain # Declare global to modify the global variable
+                        # If default_vector_store also needs to be rebuilt with new embeddings key, do it here
+                        # For now, we assume default_vector_store only uses the key from initial startup
+                        # if (default_vector_store is None or
+                        #     (hasattr(default_vector_store.embeddings, 'mistral_api_key') and
+                        #      default_vector_store.embeddings.mistral_api_key != current_mistral_api_key)):
+                        #     embeddings_for_default_store = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
+                        #     default_vector_store = FAISS.from_documents(loaded_default_docs, embeddings_for_default_store) # Need to reload docs here or pass them
+                        
                         default_qa_chain = RetrievalQA.from_chain_type(
                             llm=llm, # Use the LLM initialized with current_mistral_api_key
                             chain_type="stuff",
@@ -493,7 +499,7 @@ async def run_submission(request_body: QueryRequest):
                 answer_found = True
                 break # Exit retry loop if successful
 
-            except MistralAPIException as e: # CHANGED: Specific Mistral exception
+            except MistralAPIException as e:
                 attempt += 1
                 print(f"Mistral API error for current key (attempt {attempt}/{max_retries}): {e}")
                 if attempt < max_retries:
@@ -507,11 +513,10 @@ async def run_submission(request_body: QueryRequest):
             except Exception as e:
                 print(f"ERROR: Failed to process question '{question}' with RAG chain (non-Mistral API error): {e}")
                 answers.append(f"An unexpected error occurred: {e}")
-                answer_found = True # Treat as answered (with error message) to avoid infinite loop
-                break # Exit retry loop
+                answer_found = True
+                break
             
         if not answer_found and attempt >= max_retries:
-            # This case handles if all retries were exhausted specifically for quota and no answer was appended.
             answers.append(f"Failed to answer '{question}' after multiple retries due to persistent API quota limits.")
 
         print(f"Answer generated for '{question}'.")
