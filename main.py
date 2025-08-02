@@ -3,8 +3,8 @@ import requests
 from dotenv import load_dotenv
 import uuid
 from pathlib import Path
-import time # For retries
-import itertools # For cycling through API keys
+import time
+import itertools
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -21,9 +21,16 @@ except ImportError:
 
 # --- MISTRAL AI Imports ---
 from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
-# For specific error handling (MistralAIException is often caught by base Exception or directly by LangChain)
-# from mistralai.client import MistralClient # Not directly used for exceptions in LangChain integration
-from mistralai.exceptions import MistralAPIException # Specific exception to catch for rate limits etc.
+# Try a more general import for the exception to avoid submodule issues
+try:
+    from mistralai.exceptions import MistralAPIException
+except ImportError:
+    # Fallback if mistralai.exceptions is not found directly
+    # In older versions or specific setups, it might be tied to the client object
+    # Or, as a last resort, catch a broader exception like requests.exceptions.RequestException
+    print("WARNING: Could not import MistralAPIException directly. Will try a general API exception catch.")
+    MistralAPIException = requests.exceptions.RequestException # Use a more general exception if specific one fails
+
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
@@ -38,48 +45,37 @@ API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 if not API_BEARER_TOKEN:
     raise ValueError("API_BEARER_TOKEN environment variable is not set. Please add it to your .env file or Render environment.")
 
-# Retrieve multiple Mistral API Keys from environment variable
-# Expects a comma-separated string of keys, e.g., "key1,key2,key3"
-MISTRAL_API_KEYS_STR = os.getenv("MISTRAL_API_KEYS") # CHANGED: Environment variable name
+MISTRAL_API_KEYS_STR = os.getenv("MISTRAL_API_KEYS")
 if not MISTRAL_API_KEYS_STR:
     raise ValueError("MISTRAL_API_KEYS environment variable is not set. Please add it to your .env file or Render environment.")
 
 MISTRAL_API_KEYS = [k.strip() for k in MISTRAL_API_KEYS_STR.split(',')]
-if not MISTRAL_API_KEYS: # Ensure list is not empty after splitting
+if not MISTRAL_API_KEYS:
     raise ValueError("MISTRAL_API_KEYS environment variable is set but contains no valid keys.")
 
-# Global iterator for cycling through API keys
 api_key_iterator = itertools.cycle(MISTRAL_API_KEYS)
-current_mistral_api_key = next(api_key_iterator) # Initialize with the first key
+current_mistral_api_key = next(api_key_iterator)
 
 def get_next_api_key():
-    """Cycles to the next API key in the list."""
     global current_mistral_api_key
     current_mistral_api_key = next(api_key_iterator)
     print(f"Switched to next Mistral API Key. Current key (partial): {current_mistral_api_key[:5]}...")
     return current_mistral_api_key
 
-# Define the path to the merged PDF document (fallback/initial document)
-# IMPORTANT: If you upload a combined PDF to your GitHub repo,
-# ensure it's named 'policy.pdf' and placed in the root directory.
-# Otherwise, update this path to match your combined PDF's name.
 PDF_PATH = "policy.pdf"
 
-# --- FastAPI App Initialization ---
 app = FastAPI(
-    title="LLM-Powered Intelligent Query–Retrieval System (Mistral AI)", # CHANGED: Title
+    title="LLM-Powered Intelligent Query–Retrieval System (Mistral AI)",
     description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains.",
     version="1.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
 
-# --- Global RAG Chain Components ---
 default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
 
-
-# --- Prompt Engineering with Extensive Few-Shot Examples (Sources Removed) ---
+# --- Prompt Engineering (remains same) ---
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
 Your task is to answer user queries accurately, concisely, and comprehensively, based **only** on the provided context.
@@ -397,12 +393,10 @@ async def startup_event():
         print(f"Created {len(docs)} text chunks for default policy.")
 
         print("Creating embeddings and building default FAISS vector store (this may take a moment)...")
-        # CHANGED: Use MistralAIEmbeddings
         embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
         default_vector_store = FAISS.from_documents(docs, embeddings)
         print("Default FAISS vector store built successfully.")
 
-        # CHANGED: Use ChatMistralAI
         llm = ChatMistralAI(model="mistral-small-latest", temperature=0, mistral_api_key=current_mistral_api_key)
         
         default_qa_chain = RetrievalQA.from_chain_type(
@@ -431,9 +425,8 @@ async def run_submission(request_body: QueryRequest):
     Processes a list of natural language questions against the provided document(s) (URL or default)
     and returns contextual answers.
     """
-    global default_qa_chain, default_vector_store # ADD default_vector_store here if it's ever reassigned too
-    # It seems default_vector_store is only assigned once in startup, so it might not need 'global' here,
-    # but for clarity and safety, it's good to include all global components that might be touched.
+    # Declare global variables used in this function
+    global default_qa_chain, default_vector_store, current_mistral_api_key # Added current_mistral_api_key
 
     current_vector_store = None
     current_qa_chain = None
@@ -472,19 +465,12 @@ async def run_submission(request_body: QueryRequest):
                         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
                     )
                 else:
-                    # Use the globally pre-initialized chain for default policy.pdf
-                    # If key was rotated, we need to rebuild the default_qa_chain to use the new key
-                    # default_qa_chain and default_vector_store are already declared global at function start
+                    # For the default chain, if the key was just rotated, we need to rebuild it
+                    # to ensure it uses the new key for its internal LLM and Embeddings.
+                    # This ensures the default_qa_chain's LLM uses the current key from rotation.
+                    # Note: default_vector_store's embeddings are only set once at startup.
                     if default_qa_chain is None or default_qa_chain.llm.mistral_api_key != current_mistral_api_key:
                         print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
-                        # If default_vector_store also needs to be rebuilt with new embeddings key, do it here
-                        # For now, we assume default_vector_store only uses the key from initial startup
-                        # if (default_vector_store is None or
-                        #     (hasattr(default_vector_store.embeddings, 'mistral_api_key') and
-                        #      default_vector_store.embeddings.mistral_api_key != current_mistral_api_key)):
-                        #     embeddings_for_default_store = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
-                        #     default_vector_store = FAISS.from_documents(loaded_default_docs, embeddings_for_default_store) # Need to reload docs here or pass them
-                        
                         default_qa_chain = RetrievalQA.from_chain_type(
                             llm=llm, # Use the LLM initialized with current_mistral_api_key
                             chain_type="stuff",
@@ -523,10 +509,6 @@ async def run_submission(request_body: QueryRequest):
 
     print("--- All questions processed. Sending response. ---")
     return {"answers": answers}
-
-# The finally block outside the question loop will clean up temp files
-# This might be an issue if an error occurs early and temp_doc_path is not set.
-# The current placement inside the main try-except block and `finally` for the entire function is okay.
 
 # --- Root Endpoint (Optional, for quick health check) ---
 @app.get("/", include_in_schema=False)
