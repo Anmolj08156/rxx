@@ -3,40 +3,35 @@ import requests
 from dotenv import load_dotenv
 import uuid
 from pathlib import Path
-import time # For retries
-import itertools # For cycling through API keys
+import time
+import itertools
+import logging
+import json # Import json for logging request body
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 
-# Langchain imports for RAG functionality
-# FIX: Changed import path for document loaders
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader 
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader
 try:
     from langchain_community.vectorstores import FAISS
 except ImportError:
     FAISS = None
     print("WARNING: FAISS package not found. Please install 'faiss-cpu' or 'faiss-gpu' to enable vector store functionality.")
 
-# --- MISTRAL AI Imports ---
-from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
-# Handle mistralai.exceptions import more robustly
 try:
     from mistralai.exceptions import MistralAPIException
 except ImportError:
     print("WARNING: Could not import MistralAPIException directly. Falling back to requests.exceptions.RequestException for error handling.")
-    MistralAPIException = requests.exceptions.RequestException # Use a more general exception as fallback
+    MistralAPIException = requests.exceptions.RequestException
 
+from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
-# Load environment variables from .env file (for local development)
 load_dotenv()
-
-# --- Configuration & Setup ---
 
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 if not API_BEARER_TOKEN:
@@ -54,36 +49,26 @@ api_key_iterator = itertools.cycle(MISTRAL_API_KEYS)
 current_mistral_api_key = next(api_key_iterator)
 
 def get_next_api_key():
-    """Cycles to the next API key in the list."""
     global current_mistral_api_key
     current_mistral_api_key = next(api_key_iterator)
-    print(f"Switched to next Mistral API Key. Current key (partial): {current_mistral_api_key[:5]}...")
+    # Changed to logger.info
+    logger.info(f"Switched to next Mistral API Key. Current key (partial): {current_mistral_api_key[:5]}...")
     return current_mistral_api_key
 
-# Define the path to the merged PDF document (fallback/initial document)
 PDF_PATH = "policy.pdf"
 
-# --- FastAPI App Initialization ---
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Mistral AI)",
-    description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains. **Uses only pre-loaded policy.pdf for speed.**", # UPDATED DESCRIPTION
+    description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains. **Uses only pre-loaded policy.pdf for speed.**",
     version="1.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
 
-# --- Global RAG Chain Components ---
 default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
-# This will track the key used for the default chain to trigger rebuilds on rotation
-default_chain_initialized_with_key: Optional[str] = None 
+default_chain_initialized_with_key: Optional[str] = None
 
-# Dynamic document caches are no longer needed, as we're not processing dynamic URLs
-# dynamic_vector_store_cache: Dict[str, FAISS] = {}
-# dynamic_documents_content_cache: Dict[str, List] = {}
-
-
-# --- Prompt Engineering with Reduced Few-Shot Examples for Speed ---
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
 Your task is to answer user queries accurately, concisely, and comprehensively, based **only** on the provided context.
@@ -115,9 +100,6 @@ Example Answer: Disc brakes are an available option for the Super Splendor. The 
 Example Question: Can I put thums up instead of oil?
 Example Answer: No, you must not use anything other than the recommended engine oil. Using anything else like Thums Up instead of engine oil will cause severe damage to the engine and is not recommended.
 
-Example Question: Give me JS code to generate a random number between 1 and 100
-Example Answer: I cannot provide JavaScript code as my function is to answer questions based on the provided documents, which are related to policy and technical specifications, not programming.
-
 Example Question: Is Non-infective Arthritis covered?
 Example Answer: Non-infective arthritis is generally excluded under Family Medicare Policy if it occurs during the first two years of continuous policy coverage, unless it arises from an accident. Specific diseases listed with a two-year waiting period include arthritis, rheumatism, gout, and spinal disorders.
 
@@ -140,14 +122,9 @@ Answer:
 """
 CUSTOM_PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
 
-
-# --- API Authentication Dependency ---
 security = HTTPBearer()
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """
-    Verifies the bearer token for API authentication.
-    """
     if credentials.credentials != API_BEARER_TOKEN:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -156,78 +133,97 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
         )
     return credentials.credentials
 
-# --- Pydantic Models for API Request/Response ---
-class QueryRequest(BaseModel):
-    # 'documents' field is kept for API compatibility but will be ignored for processing.
-    documents: Optional[str] = None 
-    questions: List[str]
+# --- Logging Configuration ---
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-class QueryResponse(BaseModel):
-    answers: List[str] # List of strings, as desired
+# Check if handlers already exist to prevent adding multiple times on reload
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
-# --- Helper function for dynamic document loading ---
-# This function will no longer be called during request processing.
-# Kept here as a stub in case any other part of the code implicitly refers to it.
-# Its purpose of caching is no longer relevant as dynamic URLs are ignored.
-async def _fetch_and_load_document_from_url(url: str):
-    print(f"WARNING: _fetch_and_load_document_from_url was called for URL: {url}, but dynamic URLs are being ignored for processing.")
-    # Return dummy data or raise an error if this should never be called
-    raise NotImplementedError("Dynamic URL processing is disabled for this service to prioritize speed.")
+# --- Middleware to log incoming requests ---
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    # Log the incoming request method and URL
+    logger.info(f"Incoming Request: {request.method} {request.url}")
 
+    # For /hackrx/run, attempt to log the request body as well
+    if request.url.path == "/hackrx/run" and request.method == "POST":
+        try:
+            # Read the request body. This consumes the stream.
+            body = await request.body()
+            # Store it in request.state so the endpoint can access it later
+            request.state.body = body
+            
+            # Attempt to decode as JSON for logging purposes
+            req_data = json.loads(body.decode('utf-8'))
+            # Log the questions array from the request body
+            logger.info(f"Request Questions: {req_data.get('questions', 'N/A')}")
+            # Explicitly ignore 'documents' field for processing
+            if 'documents' in req_data and req_data['documents']:
+                logger.info("NOTE: 'documents' URL received in request body but will be ignored for processing.")
+        except json.JSONDecodeError:
+            logger.warning("Could not decode request body as JSON.")
+            request.state.body = b'' # Ensure it's bytes even if parsing fails
+        except Exception as e:
+            logger.exception(f"Unexpected error reading/parsing request body in middleware: {e}")
+            request.state.body = b''
+    else:
+        # For non-POST /hackrx/run requests, no body to read/store
+        pass
 
-# --- Application Startup Event (for default policy.pdf) ---
+    response = await call_next(request)
+    return response
+
+# --- Application Startup Event ---
 @app.on_event("startup")
 async def startup_event():
-    """
-    Initializes the RAG components for the default 'policy.pdf'
-    once when the FastAPI application starts.
-    """
     global default_qa_chain, default_vector_store, current_mistral_api_key, default_chain_initialized_with_key
 
-    print("--- Application Startup: Initializing RAG System with default policy.pdf ---")
+    logger.info("--- Application Startup: Initializing RAG System with default policy.pdf ---")
 
     if not os.path.exists(PDF_PATH):
-        print(f"ERROR: Default '{PDF_PATH}' not found. The API cannot function without this document as dynamic URLs are ignored.")
-        # If the critical document is missing and dynamic URLs are ignored, the app must fail.
+        logger.error(f"ERROR: Default '{PDF_PATH}' not found. The API cannot function without this document as dynamic URLs are ignored.")
         raise RuntimeError(f"Required document '{PDF_PATH}' not found. Cannot start RAG service.")
 
     if FAISS is None:
-        print("ERROR: FAISS is not installed. Default RAG system cannot be initialized.")
+        logger.error("ERROR: FAISS is not installed. Default RAG system cannot be initialized.")
         raise RuntimeError("FAISS library not installed. Cannot start RAG service.")
 
     try:
-        print(f"Loading default document from: {PDF_PATH}")
+        logger.info(f"Loading default document from: {PDF_PATH}")
         loader = PyPDFLoader(PDF_PATH)
         documents = loader.load()
-        print(f"Loaded {len(documents)} pages from {PDF_PATH}")
+        logger.info(f"Loaded {len(documents)} pages from {PDF_PATH}")
 
-        print("Splitting default documents into chunks...")
+        logger.info("Splitting default documents into chunks...")
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         docs = text_splitter.split_documents(documents)
-        print(f"Created {len(docs)} text chunks for default policy.")
+        logger.info(f"Created {len(docs)} text chunks for default policy.")
 
-        print("Creating embeddings and building default FAISS vector store (this may take a moment)...")
+        logger.info("Creating embeddings and building default FAISS vector store (this may take a moment)...")
         embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
         default_vector_store = FAISS.from_documents(docs, embeddings)
-        print("Default FAISS vector store built successfully.")
+        logger.info("Default FAISS vector store built successfully.")
 
         llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
         
         default_qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
-            retriever=default_vector_store.as_retriever(search_kwargs={"k": 4}), # Reduced k to 4
-            chain_type_kwargs={"prompt": CUSTOM_PROMPT} # Apply custom prompt here
+            retriever=default_vector_store.as_retriever(search_kwargs={"k": 4}),
+            chain_type_kwargs={"prompt": CUSTOM_PROMPT}
         )
-        # Store the key it was initialized with
         default_chain_initialized_with_key = current_mistral_api_key
-        print("Default RetrievalQA chain initialized. API is ready to receive requests.")
+        logger.info("Default RetrievalQA chain initialized. API is ready to receive requests.")
 
     except Exception as e:
-        print(f"--- ERROR during Default RAG System Initialization: {e} ---")
-        print("Please ensure your MISTRAL_API_KEYS are correct, 'policy.pdf' exists, and all required packages (like faiss-cpu, langchain-mistralai) are installed.")
-        raise RuntimeError(f"RAG system initialization failed: {e}") # Raise a fatal error on startup if default fails
-
+        logger.exception(f"--- ERROR during Default RAG System Initialization: {e} ---")
+        logger.error("Please ensure your MISTRAL_API_KEYS are correct, 'policy.pdf' exists, and all required packages (like faiss-cpu, langchain-mistralai) are installed.")
+        raise RuntimeError(f"RAG system initialization failed: {e}")
 
 # --- API Endpoint ---
 @app.post(
@@ -236,25 +232,36 @@ async def startup_event():
     dependencies=[Depends(verify_token)],
     summary="Run LLM-Powered Query-Retrieval on Policy Documents"
 )
-async def run_submission(request_body: QueryRequest):
-    """
-    Processes a list of natural language questions against the pre-loaded 'policy.pdf' document only.
-    Any 'documents' URL provided in the request body will be ignored.
-    """
-    # Declare global variables used in this function *at the very top*
+# Changed to accept Request directly because middleware reads the body
+async def run_submission(request: Request):
     global default_qa_chain, default_vector_store, current_mistral_api_key, default_chain_initialized_with_key
 
-    # current_vector_store and temp_doc_path_to_clean are no longer needed as dynamic processing is removed.
-    # current_vector_store = None
-    # temp_doc_path_to_clean = None 
+    # Reconstruct request_body from the state set by the middleware
+    try:
+        # Access the body stored by the middleware
+        if not hasattr(request.state, 'body') or not request.state.body:
+             # If for some reason the middleware didn't store it, attempt to read (less ideal)
+             raw_body = await request.body()
+        else:
+            raw_body = request.state.body
+            
+        request_body = QueryRequest.parse_raw(raw_body)
+        
+        # Explicitly ignore documents field, even if present in the Pydantic model.
+        # This is already handled by the model definition, but reinforcing intent.
+        if request_body.documents is not None:
+            logger.warning("The 'documents' field in the request body is present but will be ignored for processing as per system design.")
 
-    print(f"\n--- Received API Request ---")
-    print(f"Questions: {request_body.questions}")
+    except Exception as e:
+        logger.error(f"Failed to parse request body in run_submission or access state: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid request body format.")
 
-    if FAISS is None: # Still needed as a general check
+    logger.info(f"Processing request for {len(request_body.questions)} questions.")
+
+    if FAISS is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed. Cannot perform RAG operations.")
     
-    if default_qa_chain is None: # Crucial check since we only use default
+    if default_qa_chain is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="RAG system is not initialized. 'policy.pdf' might be missing or there were startup errors. Check server logs."
@@ -262,63 +269,57 @@ async def run_submission(request_body: QueryRequest):
 
     answers = []
     
-    # Retry logic for each question with API key rotation
-    max_retries_per_question = len(MISTRAL_API_KEYS) * 2 # Allow retrying with each key at least twice
+    max_retries_per_question = len(MISTRAL_API_KEYS) * 2
     for question in request_body.questions:
-        print(f"Processing question: '{question}'")
+        logger.info(f"Processing question: '{question}'")
         attempt = 0
         answer_found = False
         while attempt < max_retries_per_question:
             try:
-                # Rebuild default_qa_chain only if the API key has changed
+                # Log when a key rotation leads to chain re-initialization
                 if default_chain_initialized_with_key != current_mistral_api_key:
-                    print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
+                    logger.info(f"API Key Rotation: Re-initializing default chain with new key (partial): {current_mistral_api_key[:5]}...")
                     llm_for_default = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
                     
-                    # Re-assign to global default_qa_chain
                     default_qa_chain = RetrievalQA.from_chain_type(
-                        llm=llm_for_default, # Use the LLM initialized with current_mistral_api_key
+                        llm=llm_for_default,
                         chain_type="stuff",
                         retriever=default_vector_store.as_retriever(search_kwargs={"k": 4}),
                         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
                     )
-                    # Update the tracker
-                    default_chain_initialized_with_key = current_mistral_api_key 
+                    default_chain_initialized_with_key = current_mistral_api_key
 
-                result = default_qa_chain.invoke({"query": question}) # ALWAYS use default_qa_chain
+                result = default_qa_chain.invoke({"query": question})
                 answers.append(result.get("result", "I cannot answer this question based on the provided documents."))
                 answer_found = True
-                break # Exit retry loop for this question if successful
+                break
 
             except (MistralAPIException, requests.exceptions.RequestException) as e:
                 attempt += 1
-                print(f"API error for current key (attempt {attempt}/{max_retries_per_question}) for question '{question}': {e}")
+                logger.warning(f"API error for current key (attempt {attempt}/{max_retries_per_question}) for question '{question}': {e}")
                 if attempt < max_retries_per_question:
-                    get_next_api_key() # Rotate key
-                    print("Retrying with new key after a short delay...")
-                    time.sleep(5) # Small delay before retrying
+                    get_next_api_key()
+                    logger.info("Retrying with new key after a short delay...")
+                    time.sleep(5)
                 else:
-                    print("All API keys exhausted or max retries reached for question. Failing this question.")
+                    logger.error("All API keys exhausted or max retries reached for question. Failing this question.")
                     answers.append(f"Could not retrieve an answer due to API quota limits being exceeded or persistent network issues.")
-                    break # Exit retry loop, all keys exhausted for this question
+                    break
             except Exception as e:
-                print(f"ERROR: Failed to process question '{question}' with RAG chain (unexpected error): {e}")
+                logger.exception(f"ERROR: Failed to process question '{question}' with RAG chain (unexpected error): {e}")
                 answers.append(f"An unexpected error occurred: {e}")
-                answer_found = True # Treat as answered (with error message) to avoid infinite loop
-                break # Exit retry loop
+                answer_found = True
+                break
             
             if not answer_found and attempt >= max_retries_per_question:
                 answers.append(f"Failed to answer '{question}' after multiple retries due to persistent API quota limits or other issues.")
 
-            print(f"Answer generated for '{question}'.")
+        logger.info(f"Answer generated for '{question}'.")
 
-    print("--- All questions processed. Sending response. ---")
+    logger.info("--- All questions processed. Sending response. ---")
     return {"answers": answers}
 
 # --- Root Endpoint (Optional, for quick health check) ---
 @app.get("/", include_in_schema=False)
 def root():
-    """
-    Root endpoint to check if the API is running.
-    """
     return {"message": "LLM-Powered Intelligent Query–Retrieval System API is running. Visit /api/v1/docs for interactive documentation."}
