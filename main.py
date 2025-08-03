@@ -171,9 +171,14 @@ async def log_requests(request: Request, call_next):
             req_data = json.loads(body.decode('utf-8'))
             # Log the questions array from the request body
             logger.info(f"Request Questions: {req_data.get('questions', 'N/A')}")
-            # Explicitly ignore 'documents' field for processing
-            if 'documents' in req_data and req_data['documents']:
-                logger.info("NOTE: 'documents' URL received in request body but will be ignored for processing.")
+            
+            # Extract and log the 'documents' URL if present
+            documents_url = req_data.get('documents')
+            if documents_url:
+                logger.info(f"NOTE: 'documents' URL received in request body: '{documents_url}' but will be ignored for processing.")
+            else:
+                logger.info("NOTE: 'documents' field not present or empty in request body.")
+
         except json.JSONDecodeError:
             logger.warning("Could not decode request body as JSON.")
             request.state.body = b'' # Ensure it's bytes even if parsing fails
@@ -195,7 +200,7 @@ async def startup_event():
     logger.info("--- Application Startup: Initializing RAG System with default policy.pdf ---")
 
     if not os.path.exists(PDF_PATH):
-        logger.error(f"ERROR: Default '{PDF_PATH}' not found. The API cannot function without this document as dynamic URLs are ignored.")
+        logger.error(f"ERROR: Default '{PDF_PATH}' not found. The API cannot function without this document as dynamic URLs is ignored.")
         raise RuntimeError(f"Required document '{PDF_PATH}' not found. Cannot start RAG service.")
 
     if FAISS is None:
@@ -237,7 +242,7 @@ async def startup_event():
 # --- API Endpoint ---
 @app.post(
     "/hackrx/run",
-    response_model=QueryResponse, # This line was the reported error line
+    response_model=QueryResponse,
     dependencies=[Depends(verify_token)],
     summary="Run LLM-Powered Query-Retrieval on Policy Documents"
 )
@@ -246,23 +251,19 @@ async def run_submission(request: Request):
 
     # Reconstruct request_body from the state set by the middleware
     try:
-        # Access the body stored by the middleware
-        if not hasattr(request.state, 'body') or not request.state.body:
-             # This branch should ideally not be hit if middleware is working, but provides a fallback
-             raw_body = await request.body() # Read directly if not in state
-        else:
-            raw_body = request.state.body
+        raw_body = request.state.body
+        if not raw_body: # Check if body is empty
+            raise ValueError("Request body is empty.")
             
         request_body = QueryRequest.parse_raw(raw_body)
         
-        # Explicitly ignore documents field, even if present in the Pydantic model.
-        # This is already handled by the model definition, but reinforcing intent.
+        # Explicitly reiterate that 'documents' is ignored, as per your request
         if request_body.documents is not None:
             logger.warning("The 'documents' field in the request body is present but will be ignored for processing as per system design.")
 
     except Exception as e:
         logger.error(f"Failed to parse request body in run_submission or access state: {e}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid request body format.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid request body format or missing data.")
 
     logger.info(f"Processing request for {len(request_body.questions)} questions.")
 
