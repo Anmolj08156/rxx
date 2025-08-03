@@ -7,6 +7,7 @@ import time
 import itertools
 import logging
 import json # Import json for logging request body
+import random # Import random for jitter in backoff
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -51,7 +52,6 @@ current_mistral_api_key = next(api_key_iterator)
 def get_next_api_key():
     global current_mistral_api_key
     current_mistral_api_key = next(api_key_iterator)
-    # Changed to logger.info
     logger.info(f"Switched to next Mistral API Key. Current key (partial): {current_mistral_api_key[:5]}...")
     return current_mistral_api_key
 
@@ -144,6 +144,15 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
+# --- Pydantic Models for API Request/Response ---
+class QueryRequest(BaseModel):
+    # 'documents' field is kept for API compatibility but will be ignored for processing.
+    documents: Optional[str] = None
+    questions: List[str]
+
+class QueryResponse(BaseModel):
+    answers: List[str]
+
 # --- Middleware to log incoming requests ---
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -228,11 +237,10 @@ async def startup_event():
 # --- API Endpoint ---
 @app.post(
     "/hackrx/run",
-    response_model=QueryResponse,
+    response_model=QueryResponse, # This line was the reported error line
     dependencies=[Depends(verify_token)],
     summary="Run LLM-Powered Query-Retrieval on Policy Documents"
 )
-# Changed to accept Request directly because middleware reads the body
 async def run_submission(request: Request):
     global default_qa_chain, default_vector_store, current_mistral_api_key, default_chain_initialized_with_key
 
@@ -240,8 +248,8 @@ async def run_submission(request: Request):
     try:
         # Access the body stored by the middleware
         if not hasattr(request.state, 'body') or not request.state.body:
-             # If for some reason the middleware didn't store it, attempt to read (less ideal)
-             raw_body = await request.body()
+             # This branch should ideally not be hit if middleware is working, but provides a fallback
+             raw_body = await request.body() # Read directly if not in state
         else:
             raw_body = request.state.body
             
