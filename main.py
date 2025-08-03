@@ -60,12 +60,14 @@ def get_next_api_key():
     return current_mistral_api_key
 
 # Define the path to the merged PDF document (fallback/initial document)
+# IMPORTANT: This will now be the ONLY document source used for answers.
+# Ensure your combined PDF is named 'policy.pdf' and placed in the root directory of your GitHub repo.
 PDF_PATH = "policy.pdf"
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Mistral AI)",
-    description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains.",
+    description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains. **Uses only pre-loaded policy.pdf for speed.**", # UPDATED DESCRIPTION
     version="1.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
@@ -74,9 +76,12 @@ app = FastAPI(
 # --- Global RAG Chain Components ---
 default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
-# Cache for dynamic vector stores to avoid re-processing same URL multiple times within a single instance's lifetime
-dynamic_vector_store_cache: Dict[str, FAISS] = {}
-dynamic_documents_content_cache: Dict[str, List] = {} # Cache raw documents to avoid re-loading from disk after first parse
+# This will track the key used for the default chain to trigger rebuilds on rotation
+default_chain_initialized_with_key: Optional[str] = None 
+
+# Dynamic document caches are no longer needed, as we're not processing dynamic URLs
+# dynamic_vector_store_cache: Dict[str, FAISS] = {}
+# dynamic_documents_content_cache: Dict[str, List] = {}
 
 
 # --- Prompt Engineering with Reduced Few-Shot Examples for Speed ---
@@ -154,64 +159,21 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
 
 # --- Pydantic Models for API Request/Response ---
 class QueryRequest(BaseModel):
-    documents: Optional[str] = None # URL to a PDF, Word doc, or other supported type
+    # 'documents' field is kept for API compatibility but will be ignored for processing.
+    documents: Optional[str] = None 
     questions: List[str]
 
 class QueryResponse(BaseModel):
     answers: List[str] # List of strings, as desired
 
 # --- Helper function for dynamic document loading ---
-# Cache for dynamic vector stores to avoid re-processing same URL multiple times within a single instance's lifetime
-dynamic_vector_store_cache: Dict[str, FAISS] = {}
-dynamic_documents_content_cache: Dict[str, List] = {} # Cache raw documents to avoid re-loading from disk after first parse
-
-
+# This function will no longer be called during request processing.
+# Kept here as a stub in case any other part of the code implicitly refers to it.
+# Its purpose of caching is no longer relevant as dynamic URLs are ignored.
 async def _fetch_and_load_document_from_url(url: str):
-    """
-    Fetches a document from a given URL, saves it temporarily, and loads it.
-    Supports PDF and DOCX based on file extension.
-    Caches the loaded documents to avoid repeated file operations within a request.
-    """
-    # Check if document content is already in cache (prevents re-reading from temp file if just processed)
-    if url in dynamic_documents_content_cache:
-        print(f"Using cached document content for URL: {url}")
-        return dynamic_documents_content_cache[url], None # No temp path to clean up as it's from cache
-
-    temp_dir = Path("./temp_docs")
-    temp_dir.mkdir(exist_ok=True)
-
-    file_extension = url.split('.')[-1].split('?')[0].lower()
-    temp_file_name = f"temp_doc_{uuid.uuid4()}.{file_extension}"
-    temp_file_path = temp_dir / temp_file_name
-
-    print(f"Fetching document from URL: {url} to {temp_file_path}")
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-
-        with open(temp_file_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print(f"Document saved temporarily: {temp_file_path}")
-
-        if file_extension == "pdf":
-            loader = PyPDFLoader(str(temp_file_path))
-        elif file_extension in ["doc", "docx"]:
-            loader = UnstructuredWordDocumentLoader(str(temp_file_path))
-        else:
-            raise ValueError(f"Unsupported document type from URL: {file_extension}. Only PDF, DOC, DOCX are supported.")
-
-        documents = loader.load()
-        dynamic_documents_content_cache[url] = documents # Cache the loaded documents
-        print(f"Loaded {len(documents)} pages/documents from URL.")
-        return documents, temp_file_path # Return path for cleanup
-        
-    except requests.exceptions.RequestException as req_e:
-        print(f"ERROR: Failed to fetch document from URL {url}: {req_e}")
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Failed to fetch document from URL: {req_e}")
-    except Exception as e:
-        print(f"ERROR: Failed to load document from {temp_file_path}: {e}")
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Error processing document from URL: {e}")
+    print(f"WARNING: _fetch_and_load_document_from_url was called for URL: {url}, but dynamic URLs are being ignored for processing.")
+    # Return dummy data or raise an error if this should never be called
+    raise NotImplementedError("Dynamic URL processing is disabled for this service to prioritize speed.")
 
 
 # --- Application Startup Event (for default policy.pdf) ---
@@ -221,18 +183,18 @@ async def startup_event():
     Initializes the RAG components for the default 'policy.pdf'
     once when the FastAPI application starts.
     """
-    global default_qa_chain, default_vector_store, current_mistral_api_key # ADDED default_chain_initialized_with_key
-    global default_chain_initialized_with_key # Declare here too
+    global default_qa_chain, default_vector_store, current_mistral_api_key, default_chain_initialized_with_key
 
     print("--- Application Startup: Initializing RAG System with default policy.pdf ---")
 
     if not os.path.exists(PDF_PATH):
-        print(f"WARNING: Default '{PDF_PATH}' not found. The API will only work if documents are provided via URL in requests.")
-        return
+        print(f"ERROR: Default '{PDF_PATH}' not found. The API cannot function without this document as dynamic URLs are ignored.")
+        # If the critical document is missing and dynamic URLs are ignored, the app must fail.
+        raise RuntimeError(f"Required document '{PDF_PATH}' not found. Cannot start RAG service.")
 
     if FAISS is None:
         print("ERROR: FAISS is not installed. Default RAG system cannot be initialized.")
-        return
+        raise RuntimeError("FAISS library not installed. Cannot start RAG service.")
 
     try:
         print(f"Loading default document from: {PDF_PATH}")
@@ -265,7 +227,7 @@ async def startup_event():
     except Exception as e:
         print(f"--- ERROR during Default RAG System Initialization: {e} ---")
         print("Please ensure your MISTRAL_API_KEYS are correct, 'policy.pdf' exists, and all required packages (like faiss-cpu, langchain-mistralai) are installed.")
-        # Do not raise here, allow the app to start to handle dynamic document uploads
+        raise RuntimeError(f"RAG system initialization failed: {e}") # Raise a fatal error on startup if default fails
 
 
 # --- API Endpoint ---
@@ -277,144 +239,84 @@ async def startup_event():
 )
 async def run_submission(request_body: QueryRequest):
     """
-    Processes a list of natural language questions against the provided document(s) (URL or default)
-    and returns contextual answers.
+    Processes a list of natural language questions against the pre-loaded 'policy.pdf' document only.
+    Any 'documents' URL provided in the request body will be ignored.
     """
     # Declare global variables used in this function
     global default_qa_chain, default_vector_store, current_mistral_api_key, default_chain_initialized_with_key
 
-    current_vector_store = None
-    current_qa_chain = None
-    temp_doc_path_to_clean = None # Track temp path for final cleanup
+    # current_vector_store and temp_doc_path_to_clean are no longer needed as dynamic processing is removed.
+    # current_vector_store = None
+    # temp_doc_path_to_clean = None 
 
     print(f"\n--- Received API Request ---")
     print(f"Questions: {request_body.questions}")
 
-    if FAISS is None:
+    if FAISS is None: # Still needed as a general check
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed. Cannot perform RAG operations.")
+    
+    if default_qa_chain is None: # Crucial check since we only use default
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="RAG system is not initialized. 'policy.pdf' might be missing or there were startup errors. Check server logs."
+        )
 
     answers = []
     
-    try:
-        # --- CRITICAL PERFORMANCE OPTIMIZATION FOR DYNAMIC DOCUMENTS ---
-        # Load and process dynamic document ONCE per request, not per question
-        if request_body.documents:
-            cached_vector_store = dynamic_vector_store_cache.get(request_body.documents)
-            if cached_vector_store:
-                print(f"Using cached FAISS vector store for URL: {request_body.documents}")
-                current_vector_store = cached_vector_store
-                # No temp_doc_path_to_clean if using cache
-            else:
-                print(f"Processing NEW dynamic document URL: {request_body.documents}")
-                documents, temp_doc_path = await _fetch_and_load_document_from_url(request_body.documents)
-                temp_doc_path_to_clean = temp_doc_path # Store for cleanup
-
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-                docs = text_splitter.split_documents(documents)
-                print(f"Created {len(docs)} text chunks for dynamic document.")
-
-                # Use current_mistral_api_key for embeddings (might be rotated)
-                embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
-                current_vector_store = FAISS.from_documents(docs, embeddings)
-                dynamic_vector_store_cache[request_body.documents] = current_vector_store # Cache the new vector store
-                print("FAISS vector store built and cached for dynamic document.")
-            
-            # Initialize LLM with the current API key (might be rotated)
-            llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
-            current_qa_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever=current_vector_store.as_retriever(search_kwargs={"k": 4}), # Reduced k
-                chain_type_kwargs={"prompt": CUSTOM_PROMPT}
-            )
-            print("RetrievalQA chain initialized for dynamic document.")
-        else:
-            print(f"Processing request with default document: {PDF_PATH}")
-            if default_qa_chain is None:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Default RAG system is not initialized. 'policy.pdf' might be missing or there were startup errors."
-                )
-            # Rebuild default_qa_chain only if the API key has changed
-            # Check if default_chain_initialized_with_key exists and is different from current_mistral_api_key
-            if default_chain_initialized_with_key != current_mistral_api_key:
-                 print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
-                 llm_for_default = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
-                 default_qa_chain = RetrievalQA.from_chain_type(
-                    llm=llm_for_default, # Use the LLM initialized with current_mistral_api_key
-                    chain_type="stuff",
-                    retriever=default_vector_store.as_retriever(search_kwargs={"k": 4}),
-                    chain_type_kwargs={"prompt": CUSTOM_PROMPT}
-                )
-                 default_chain_initialized_with_key = current_mistral_api_key # Update tracker
-            current_qa_chain = default_qa_chain
-
-        # --- Process each question using the ONE prepared QA chain for this request ---
-        max_retries_per_question = len(MISTRAL_API_KEYS) * 2 # Allow retrying with each key at least twice
-        for question in request_body.questions:
-            print(f"Processing question: '{question}'")
-            attempt = 0
-            answer_found = False
-            while attempt < max_retries_per_question:
-                try:
-                    # For a retry within a question, rebuild current_qa_chain's LLM with current_mistral_api_key
-                    llm_for_retry = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
-                    current_qa_chain = RetrievalQA.from_chain_type(
-                        llm=llm_for_retry,
+    # Retry logic for each question with API key rotation
+    max_retries_per_question = len(MISTRAL_API_KEYS) * 2 # Allow retrying with each key at least twice
+    for question in request_body.questions:
+        print(f"Processing question: '{question}'")
+        attempt = 0
+        answer_found = False
+        while attempt < max_retries_per_question:
+            try:
+                # Always use the default_qa_chain, ensuring its LLM is updated with current_mistral_api_key
+                if default_chain_initialized_with_key != current_mistral_api_key:
+                    print(f"Re-initializing default chain with new key (partial): {current_mistral_api_key[:5]}...")
+                    llm_for_default = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
+                    # Note: default_vector_store's embeddings are only set once at startup.
+                    # If an embedding API key changes, you'd need to re-create default_vector_store too.
+                    # For simplicity, we assume embedding API limits are less restrictive.
+                    global default_qa_chain # Re-declare global to modify it
+                    default_qa_chain = RetrievalQA.from_chain_type(
+                        llm=llm_for_default, # Use the LLM initialized with current_mistral_api_key
                         chain_type="stuff",
-                        retriever=current_qa_chain.retriever, # Keep the same retriever instance
+                        retriever=default_vector_store.as_retriever(search_kwargs={"k": 4}),
                         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
                     )
+                    global default_chain_initialized_with_key # Re-declare global to modify it
+                    default_chain_initialized_with_key = current_mistral_api_key # Update tracker
 
-                    result = current_qa_chain.invoke({"query": question})
-                    answers.append(result.get("result", "I cannot answer this question based on the provided documents."))
-                    answer_found = True
-                    break # Exit retry loop for this question if successful
+                result = default_qa_chain.invoke({"query": question}) # ALWAYS use default_qa_chain
+                answers.append(result.get("result", "I cannot answer this question based on the provided documents."))
+                answer_found = True
+                break # Exit retry loop for this question if successful
 
-                except (MistralAPIException, requests.exceptions.RequestException) as e:
-                    attempt += 1
-                    print(f"API error for current key (attempt {attempt}/{max_retries_per_question}) for question '{question}': {e}")
-                    if attempt < max_retries_per_question:
-                        get_next_api_key() # Rotate key
-                        print("Retrying with new key after a short delay...")
-                        time.sleep(5) # Small delay before retrying
-                    else:
-                        print("All API keys exhausted or max retries reached for question. Failing this question.")
-                        answers.append(f"Could not retrieve an answer due to API quota limits being exceeded or persistent network issues.")
-                        break # Exit retry loop, all keys exhausted for this question
-                except Exception as e:
-                    print(f"ERROR: Failed to process question '{question}' with RAG chain (unexpected error): {e}")
-                    answers.append(f"An unexpected error occurred: {e}")
-                    answer_found = True # Treat as answered (with error message) to avoid infinite loop
-                    break # Exit retry loop
+            except (MistralAPIException, requests.exceptions.RequestException) as e:
+                attempt += 1
+                print(f"API error for current key (attempt {attempt}/{max_retries_per_question}) for question '{question}': {e}")
+                if attempt < max_retries_per_question:
+                    get_next_api_key() # Rotate key
+                    print("Retrying with new key after a short delay...")
+                    time.sleep(5) # Small delay before retrying
+                else:
+                    print("All API keys exhausted or max retries reached for question. Failing this question.")
+                    answers.append(f"Could not retrieve an answer due to API quota limits being exceeded or persistent network issues.")
+                    break # Exit retry loop, all keys exhausted for this question
+            except Exception as e:
+                print(f"ERROR: Failed to process question '{question}' with RAG chain (unexpected error): {e}")
+                answers.append(f"An unexpected error occurred: {e}")
+                answer_found = True # Treat as answered (with error message) to avoid infinite loop
+                break # Exit retry loop
             
             if not answer_found and attempt >= max_retries_per_question:
                 answers.append(f"Failed to answer '{question}' after multiple retries due to persistent API quota limits or other issues.")
 
             print(f"Answer generated for '{question}'.")
 
-        print("--- All questions processed. Sending response. ---")
-        return {"answers": answers}
-
-    except HTTPException:
-        raise # Re-raise HTTPExceptions directly
-    except Exception as e:
-        print(f"ERROR: An unexpected error occurred during overall query processing: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An internal server error occurred: {e}"
-        )
-    finally:
-        # Clean up temporary document if one was downloaded in this request
-        if temp_doc_path_to_clean and temp_doc_path_to_clean.exists():
-            try:
-                os.remove(temp_doc_path_to_clean)
-                print(f"Cleaned up temporary file: {temp_doc_path_to_clean}")
-                # Clean up temp_docs directory if it becomes empty
-                if Path("./temp_docs").exists() and not any(Path("./temp_docs").iterdir()):
-                    os.rmdir("./temp_docs")
-            except Exception as cleanup_e:
-                print(f"WARNING: Failed to clean up temporary file {temp_doc_path_to_clean}: {cleanup_e}")
+    print("--- All questions processed. Sending response. ---")
+    return {"answers": answers}
 
 # --- Root Endpoint (Optional, for quick health check) ---
 @app.get("/", include_in_schema=False)
