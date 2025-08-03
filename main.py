@@ -9,7 +9,7 @@ import itertools # For cycling through API keys
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict # ADDED Dict HERE
 
 # Langchain imports for RAG functionality
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader
@@ -74,6 +74,9 @@ app = FastAPI(
 # --- Global RAG Chain Components ---
 default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
+# Cache for dynamic vector stores to avoid re-processing same URL multiple times within a single instance's lifetime
+dynamic_vector_store_cache: Dict[str, FAISS] = {}
+dynamic_documents_content_cache: Dict[str, List] = {} # Cache raw documents to avoid re-loading from disk after first parse
 
 
 # --- Prompt Engineering with Reduced Few-Shot Examples for Speed ---
@@ -343,12 +346,20 @@ async def run_submission(request_body: QueryRequest):
             current_qa_chain = default_qa_chain
 
         # --- Process each question using the ONE prepared QA chain for this request ---
+        max_retries_per_question = len(MISTRAL_API_KEYS) * 2 # Allow retrying with each key at least twice
         for question in request_body.questions:
             print(f"Processing question: '{question}'")
             attempt = 0
             answer_found = False
-            while attempt < max_retries:
+            while attempt < max_retries_per_question:
                 try:
+                    # Re-initialize LLM and Embeddings for the *current_qa_chain* if key was just rotated by get_next_api_key()
+                    # This ensures subsequent retries within the same question use the new key
+                    current_qa_chain.llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
+                    # Note: embeddings for vector store are only initialized once per dynamic doc or at startup.
+                    # If an embedding API key changes, you'd need to re-create the embeddings and possibly the vector store.
+                    # For simplicity, we assume embedding API limits are less restrictive or less frequently hit than LLM API limits.
+
                     result = current_qa_chain.invoke({"query": question})
                     answers.append(result.get("result", "I cannot answer this question based on the provided documents."))
                     answer_found = True
@@ -356,21 +367,9 @@ async def run_submission(request_body: QueryRequest):
 
                 except (MistralAPIException, requests.exceptions.RequestException) as e:
                     attempt += 1
-                    print(f"API error for current key (attempt {attempt}/{max_retries}) for question '{question}': {e}")
-                    if attempt < max_retries:
+                    print(f"API error for current key (attempt {attempt}/{max_retries_per_question}) for question '{question}': {e}")
+                    if attempt < max_retries_per_question:
                         get_next_api_key() # Rotate key
-                        # Crucially, re-initialize LLM and Embeddings for the *current_qa_chain* if key changed
-                        llm_for_retry = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
-                        embeddings_for_retry = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
-                        
-                        # Rebuild the current_qa_chain with the new key for the next retry
-                        # This part assumes that current_vector_store is already correctly set up for this request.
-                        current_qa_chain = RetrievalQA.from_chain_type(
-                            llm=llm_for_retry,
-                            chain_type="stuff",
-                            retriever=current_vector_store.as_retriever(search_kwargs={"k": 4}),
-                            chain_type_kwargs={"prompt": CUSTOM_PROMPT}
-                        )
                         print("Retrying with new key after a short delay...")
                         time.sleep(5) # Small delay before retrying
                     else:
@@ -383,7 +382,7 @@ async def run_submission(request_body: QueryRequest):
                     answer_found = True # Treat as answered (with error message) to avoid infinite loop
                     break # Exit retry loop
             
-            if not answer_found and attempt >= max_retries:
+            if not answer_found and attempt >= max_retries_per_question:
                 answers.append(f"Failed to answer '{question}' after multiple retries due to persistent API quota limits or other issues.")
 
             print(f"Answer generated for '{question}'.")
