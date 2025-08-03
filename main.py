@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 
 # Langchain imports for RAG functionality
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader
+from langchain_community.document.loaders import PyPDFLoader, UnstructuredWordDocumentLoader
 try:
     from langchain_community.vectorstores import FAISS
 except ImportError:
@@ -60,8 +60,6 @@ def get_next_api_key():
     return current_mistral_api_key
 
 # Define the path to the merged PDF document (fallback/initial document)
-# IMPORTANT: This will now be the ONLY document source used for answers.
-# Ensure your combined PDF is named 'policy.pdf' and placed in the root directory of your GitHub repo.
 PDF_PATH = "policy.pdf"
 
 # --- FastAPI App Initialization ---
@@ -242,7 +240,7 @@ async def run_submission(request_body: QueryRequest):
     Processes a list of natural language questions against the pre-loaded 'policy.pdf' document only.
     Any 'documents' URL provided in the request body will be ignored.
     """
-    # Declare global variables used in this function
+    # Declare global variables used in this function *at the very top*
     global default_qa_chain, default_vector_store, current_mistral_api_key, default_chain_initialized_with_key
 
     # current_vector_store and temp_doc_path_to_clean are no longer needed as dynamic processing is removed.
@@ -271,22 +269,20 @@ async def run_submission(request_body: QueryRequest):
         answer_found = False
         while attempt < max_retries_per_question:
             try:
-                # Always use the default_qa_chain, ensuring its LLM is updated with current_mistral_api_key
+                # Rebuild default_qa_chain only if the API key has changed
                 if default_chain_initialized_with_key != current_mistral_api_key:
-                    print(f"Re-initializing default chain with new key (partial): {current_mistral_api_key[:5]}...")
+                    print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
                     llm_for_default = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
-                    # Note: default_vector_store's embeddings are only set once at startup.
-                    # If an embedding API key changes, you'd need to re-create default_vector_store too.
-                    # For simplicity, we assume embedding API limits are less restrictive.
-                    global default_qa_chain # Re-declare global to modify it
+                    
+                    # Re-assign to global default_qa_chain
                     default_qa_chain = RetrievalQA.from_chain_type(
                         llm=llm_for_default, # Use the LLM initialized with current_mistral_api_key
                         chain_type="stuff",
                         retriever=default_vector_store.as_retriever(search_kwargs={"k": 4}),
                         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
                     )
-                    global default_chain_initialized_with_key # Re-declare global to modify it
-                    default_chain_initialized_with_key = current_mistral_api_key # Update tracker
+                    # Update the tracker
+                    default_chain_initialized_with_key = current_mistral_api_key 
 
                 result = default_qa_chain.invoke({"query": question}) # ALWAYS use default_qa_chain
                 answers.append(result.get("result", "I cannot answer this question based on the provided documents."))
