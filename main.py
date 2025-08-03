@@ -9,7 +9,7 @@ import itertools # For cycling through API keys
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Optional, Dict # ADDED Dict HERE
+from typing import List, Optional, Dict
 
 # Langchain imports for RAG functionality
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader
@@ -74,9 +74,6 @@ app = FastAPI(
 # --- Global RAG Chain Components ---
 default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
-# NEW GLOBAL VARIABLE to track the key used for the default chain
-default_chain_initialized_with_key: Optional[str] = None 
-
 # Cache for dynamic vector stores to avoid re-processing same URL multiple times within a single instance's lifetime
 dynamic_vector_store_cache: Dict[str, FAISS] = {}
 dynamic_documents_content_cache: Dict[str, List] = {} # Cache raw documents to avoid re-loading from disk after first parse
@@ -224,7 +221,8 @@ async def startup_event():
     Initializes the RAG components for the default 'policy.pdf'
     once when the FastAPI application starts.
     """
-    global default_qa_chain, default_vector_store, current_mistral_api_key, default_chain_initialized_with_key
+    global default_qa_chain, default_vector_store, current_mistral_api_key # ADDED default_chain_initialized_with_key
+    global default_chain_initialized_with_key # Declare here too
 
     print("--- Application Startup: Initializing RAG System with default policy.pdf ---")
 
@@ -338,6 +336,7 @@ async def run_submission(request_body: QueryRequest):
                     detail="Default RAG system is not initialized. 'policy.pdf' might be missing or there were startup errors."
                 )
             # Rebuild default_qa_chain only if the API key has changed
+            # Check if default_chain_initialized_with_key exists and is different from current_mistral_api_key
             if default_chain_initialized_with_key != current_mistral_api_key:
                  print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
                  llm_for_default = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
@@ -358,18 +357,14 @@ async def run_submission(request_body: QueryRequest):
             answer_found = False
             while attempt < max_retries_per_question:
                 try:
-                    # For a retry within a question, ensure current_qa_chain's LLM uses current_mistral_api_key
-                    # This is done by dynamically setting the LLM on the chain object if needed
-                    # (Note: Some LangChain versions might require rebuilding chain for LLM change)
-                    # To be safe, we rebuild the current_qa_chain on retry if the key changed.
-                    if current_qa_chain.llm.mistral_api_key != current_mistral_api_key:
-                        llm_for_retry = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
-                        current_qa_chain = RetrievalQA.from_chain_type(
-                            llm=llm_for_retry,
-                            chain_type="stuff",
-                            retriever=current_vector_store.as_retriever(search_kwargs={"k": 4}),
-                            chain_type_kwargs={"prompt": CUSTOM_PROMPT}
-                        )
+                    # For a retry within a question, rebuild current_qa_chain's LLM with current_mistral_api_key
+                    llm_for_retry = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
+                    current_qa_chain = RetrievalQA.from_chain_type(
+                        llm=llm_for_retry,
+                        chain_type="stuff",
+                        retriever=current_qa_chain.retriever, # Keep the same retriever instance
+                        chain_type_kwargs={"prompt": CUSTOM_PROMPT}
+                    )
 
                     result = current_qa_chain.invoke({"query": question})
                     answers.append(result.get("result", "I cannot answer this question based on the provided documents."))
