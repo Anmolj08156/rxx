@@ -21,7 +21,12 @@ except ImportError:
 
 # --- MISTRAL AI Imports ---
 from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
-from mistralai.exceptions import MistralAPIException # Specific exception to catch for rate limits etc.
+# Handle mistralai.exceptions import more robustly
+try:
+    from mistralai.exceptions import MistralAPIException
+except ImportError:
+    print("WARNING: Could not import MistralAPIException directly. Falling back to requests.exceptions.RequestException for error handling.")
+    MistralAPIException = requests.exceptions.RequestException # Use a more general exception as fallback
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
@@ -71,7 +76,7 @@ default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
 
 
-# --- Prompt Engineering with Drastically Reduced Few-Shot Examples for Speed ---
+# --- Prompt Engineering with Reduced Few-Shot Examples for Speed ---
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
 Your task is to answer user queries accurately, concisely, and comprehensively, based **only** on the provided context.
@@ -79,7 +84,7 @@ If the exact answer or sufficient information is not found in the context, state
 Do not generate information that is not supported by the context.
 
 CRITICAL INSTRUCTIONS:
-- Answer in EXACTLY 2-3 lines maximum (not paragraphs)
+- Answer in EXACTLY 2-3 lines maximum (not paragraphs).
 - Include specific numbers, amounts, percentages, and timeframes if relevant.
 - Be direct and factual - no filler words or explanations.
 - If multiple related points exist, combine them in one coherent response.
@@ -229,7 +234,6 @@ async def startup_event():
         default_vector_store = FAISS.from_documents(docs, embeddings)
         print("Default FAISS vector store built successfully.")
 
-        # CHANGED MODEL: Using open-mistral-7b for better speed
         llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
         
         default_qa_chain = RetrievalQA.from_chain_type(
@@ -282,8 +286,8 @@ async def run_submission(request_body: QueryRequest):
         while attempt < max_retries:
             try:
                 # Re-initialize LLM and Embeddings with the current_mistral_api_key for each attempt/rotation
-                llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key) # CHANGED
-                embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key) # CHANGED
+                llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
+                embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
 
                 if request_body.documents:
                     print(f"Re-initializing chain for dynamic document with key (partial): {current_mistral_api_key[:5]}...")
@@ -317,25 +321,25 @@ async def run_submission(request_body: QueryRequest):
                 answer_found = True
                 break # Exit retry loop if successful
 
-            except MistralAPIException as e:
+            except (MistralAPIException, requests.exceptions.RequestException) as e: # Catch both specific and general
                 attempt += 1
-                print(f"Mistral API error for current key (attempt {attempt}/{max_retries}): {e}")
+                print(f"API error for current key (attempt {attempt}/{max_retries}): {e}")
                 if attempt < max_retries:
                     get_next_api_key() # Rotate key
                     print("Retrying with new key after a short delay...")
                     time.sleep(5) # Small delay before retrying
                 else:
-                    print("All Mistral API keys exhausted or max retries reached. Failing this question.")
-                    answers.append(f"Could not retrieve an answer due to Mistral API quota limits being exceeded.")
+                    print("All API keys exhausted or max retries reached. Failing this question.")
+                    answers.append(f"Could not retrieve an answer due to API quota limits being exceeded or persistent network issues.")
                     break # Exit retry loop, all keys exhausted for this question
             except Exception as e:
-                print(f"ERROR: Failed to process question '{question}' with RAG chain (non-Mistral API error): {e}")
+                print(f"ERROR: Failed to process question '{question}' with RAG chain (unexpected error): {e}")
                 answers.append(f"An unexpected error occurred: {e}")
                 answer_found = True
                 break
             
         if not answer_found and attempt >= max_retries:
-            answers.append(f"Failed to answer '{question}' after multiple retries due to persistent API quota limits.")
+            answers.append(f"Failed to answer '{question}' after multiple retries due to persistent API quota limits or other issues.")
 
         print(f"Answer generated for '{question}'.")
 
