@@ -74,6 +74,9 @@ app = FastAPI(
 # --- Global RAG Chain Components ---
 default_vector_store: Optional[FAISS] = None
 default_qa_chain: Optional[RetrievalQA] = None
+# NEW GLOBAL VARIABLE to track the key used for the default chain
+default_chain_initialized_with_key: Optional[str] = None 
+
 # Cache for dynamic vector stores to avoid re-processing same URL multiple times within a single instance's lifetime
 dynamic_vector_store_cache: Dict[str, FAISS] = {}
 dynamic_documents_content_cache: Dict[str, List] = {} # Cache raw documents to avoid re-loading from disk after first parse
@@ -221,7 +224,7 @@ async def startup_event():
     Initializes the RAG components for the default 'policy.pdf'
     once when the FastAPI application starts.
     """
-    global default_qa_chain, default_vector_store, current_mistral_api_key
+    global default_qa_chain, default_vector_store, current_mistral_api_key, default_chain_initialized_with_key
 
     print("--- Application Startup: Initializing RAG System with default policy.pdf ---")
 
@@ -257,6 +260,8 @@ async def startup_event():
             retriever=default_vector_store.as_retriever(search_kwargs={"k": 4}), # Reduced k to 4
             chain_type_kwargs={"prompt": CUSTOM_PROMPT} # Apply custom prompt here
         )
+        # Store the key it was initialized with
+        default_chain_initialized_with_key = current_mistral_api_key
         print("Default RetrievalQA chain initialized. API is ready to receive requests.")
 
     except Exception as e:
@@ -278,7 +283,7 @@ async def run_submission(request_body: QueryRequest):
     and returns contextual answers.
     """
     # Declare global variables used in this function
-    global default_qa_chain, default_vector_store, current_mistral_api_key
+    global default_qa_chain, default_vector_store, current_mistral_api_key, default_chain_initialized_with_key
 
     current_vector_store = None
     current_qa_chain = None
@@ -332,17 +337,17 @@ async def run_submission(request_body: QueryRequest):
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="Default RAG system is not initialized. 'policy.pdf' might be missing or there were startup errors."
                 )
-            # Ensure default_qa_chain's LLM uses current API key if it has rotated
-            # Rebuild only if the key has changed
-            llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
-            if default_qa_chain.llm.mistral_api_key != current_mistral_api_key:
+            # Rebuild default_qa_chain only if the API key has changed
+            if default_chain_initialized_with_key != current_mistral_api_key:
                  print(f"Re-initializing default chain with key (partial): {current_mistral_api_key[:5]}...")
+                 llm_for_default = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
                  default_qa_chain = RetrievalQA.from_chain_type(
-                    llm=llm,
+                    llm=llm_for_default, # Use the LLM initialized with current_mistral_api_key
                     chain_type="stuff",
                     retriever=default_vector_store.as_retriever(search_kwargs={"k": 4}),
                     chain_type_kwargs={"prompt": CUSTOM_PROMPT}
                 )
+                 default_chain_initialized_with_key = current_mistral_api_key # Update tracker
             current_qa_chain = default_qa_chain
 
         # --- Process each question using the ONE prepared QA chain for this request ---
@@ -353,12 +358,18 @@ async def run_submission(request_body: QueryRequest):
             answer_found = False
             while attempt < max_retries_per_question:
                 try:
-                    # Re-initialize LLM and Embeddings for the *current_qa_chain* if key was just rotated by get_next_api_key()
-                    # This ensures subsequent retries within the same question use the new key
-                    current_qa_chain.llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
-                    # Note: embeddings for vector store are only initialized once per dynamic doc or at startup.
-                    # If an embedding API key changes, you'd need to re-create the embeddings and possibly the vector store.
-                    # For simplicity, we assume embedding API limits are less restrictive or less frequently hit than LLM API limits.
+                    # For a retry within a question, ensure current_qa_chain's LLM uses current_mistral_api_key
+                    # This is done by dynamically setting the LLM on the chain object if needed
+                    # (Note: Some LangChain versions might require rebuilding chain for LLM change)
+                    # To be safe, we rebuild the current_qa_chain on retry if the key changed.
+                    if current_qa_chain.llm.mistral_api_key != current_mistral_api_key:
+                        llm_for_retry = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
+                        current_qa_chain = RetrievalQA.from_chain_type(
+                            llm=llm_for_retry,
+                            chain_type="stuff",
+                            retriever=current_vector_store.as_retriever(search_kwargs={"k": 4}),
+                            chain_type_kwargs={"prompt": CUSTOM_PROMPT}
+                        )
 
                     result = current_qa_chain.invoke({"query": question})
                     answers.append(result.get("result", "I cannot answer this question based on the provided documents."))
