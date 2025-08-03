@@ -12,7 +12,8 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 
 # Langchain imports for RAG functionality
-from langchain_community.document.loaders import PyPDFLoader, UnstructuredWordDocumentLoader
+# FIX: Changed import path for document loaders
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader 
 try:
     from langchain_community.vectorstores import FAISS
 except ImportError:
