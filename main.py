@@ -16,8 +16,8 @@ except ImportError:
     FAISS = None
     print("WARNING: FAISS package not found. Please install 'faiss-cpu' or 'faiss-gpu' to enable vector store functionality.")
 
-# --- NEW IMPORTS for OpenAI ---
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+# --- NEW IMPORTS for Gemini ---
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
@@ -41,17 +41,17 @@ API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 if not API_BEARER_TOKEN:
     raise ValueError("API_BEARER_TOKEN environment variable is not set. Please add it to your environment.")
 
-# Change variable name to OPEN_API_KEYS
-OPEN_API_KEYS_STR = os.getenv("OPEN_API_KEYS")
-if not OPEN_API_KEYS_STR:
-    raise ValueError("OPEN_API_KEYS environment variable is not set. Please add it to your environment.")
+# Change variable name to GOOGLE_API_KEYS
+GOOGLE_API_KEYS_STR = os.getenv("GOOGLE_API_KEYS")
+if not GOOGLE_API_KEYS_STR:
+    raise ValueError("GOOGLE_API_KEYS environment variable is not set. Please add it to your environment.")
 
-OPEN_API_KEYS = [k.strip() for k in OPEN_API_KEYS_STR.split(',') if k.strip()]
-if not OPEN_API_KEYS:
-    raise ValueError("OPEN_API_KEYS environment variable is set but contains no valid keys.")
+GOOGLE_API_KEYS = [k.strip() for k in GOOGLE_API_KEYS_STR.split(',') if k.strip()]
+if not GOOGLE_API_KEYS:
+    raise ValueError("GOOGLE_API_KEYS environment variable is set but contains no valid keys.")
 
-api_key_iterator = itertools.cycle(OPEN_API_KEYS)
-current_open_api_key = next(api_key_iterator)
+api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
+current_google_api_key = next(api_key_iterator)
 
 # PDF path
 PDF_PATH = "policy.pdf"
@@ -68,7 +68,7 @@ if not logger.handlers:
 
 # --- FASTAPI APP INITIALIZATION ---
 app = FastAPI(
-    title="LLM-Powered Intelligent Query–Retrieval System (OpenAI)",
+    title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
     description="API for processing large documents and making contextual decisions. **Uses only pre-loaded policy.pdf for speed.**",
     version="1.0.0",
     docs_url="/api/v1/docs",
@@ -152,10 +152,10 @@ CUSTOM_PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["conte
 # --- UTILITY FUNCTIONS ---
 def get_next_api_key(retry_state: Any):
     """Callback for tenacity to rotate the API key on a retry attempt."""
-    global current_open_api_key
-    old_key_partial = current_open_api_key[:5] + "..."
-    current_open_api_key = next(api_key_iterator)
-    new_key_partial = current_open_api_key[:5] + "..."
+    global current_google_api_key
+    old_key_partial = current_google_api_key[:5] + "..."
+    current_google_api_key = next(api_key_iterator)
+    new_key_partial = current_google_api_key[:5] + "..."
     
     status_code = "N/A"
     if retry_state.outcome and retry_state.outcome.failed:
@@ -166,35 +166,35 @@ def get_next_api_key(retry_state: Any):
     logger.warning(
         f"API call failed (status {status_code}). "
         f"Rotating key from {old_key_partial} to {new_key_partial}. "
-        f"Attempt {retry_state.attempt_number + 1} of {len(OPEN_API_KEYS)}."
+        f"Attempt {retry_state.attempt_number + 1} of {len(GOOGLE_API_KEYS)}."
     )
 
 # --- CORE RAG INVOCATION WITH RETRIES ---
 @retry(
-    stop=stop_after_attempt(len(OPEN_API_KEYS)),
+    stop=stop_after_attempt(len(GOOGLE_API_KEYS)),
     wait=wait_exponential(multiplier=1, min=4, max=60),
     retry=(retry_if_exception_type(httpx.HTTPStatusError) | retry_if_exception_type(KeyError)),
     before_sleep=get_next_api_key
 )
 async def embed_with_retries(docs: List[str]):
     """Embed documents with retries and key rotation."""
-    global current_open_api_key
-    # Use OpenAIEmbeddings and set the openai_api_key parameter
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=current_open_api_key)
-    logger.info(f"Creating embeddings with key ending in {current_open_api_key[-5:]}")
+    global current_google_api_key
+    # Use GoogleGenerativeAIEmbeddings and set the google_api_key parameter
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=current_google_api_key)
+    logger.info(f"Creating embeddings with key ending in {current_google_api_key[-5:]}")
     return FAISS.from_documents(docs, embeddings)
 
 @retry(
-    stop=stop_after_attempt(len(OPEN_API_KEYS)),
+    stop=stop_after_attempt(len(GOOGLE_API_KEYS)),
     wait=wait_exponential(multiplier=1, min=4, max=60),
     retry=(retry_if_exception_type(httpx.HTTPStatusError) | retry_if_exception_type(KeyError)),
     before_sleep=get_next_api_key
 )
 async def process_question_with_retries(question: str, vector_store: FAISS) -> str:
     """Handles the RAG chain invocation with built-in retries and key rotation."""
-    global current_open_api_key
-    # Use ChatOpenAI and set the openai_api_key parameter
-    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0, openai_api_key=current_open_api_key)
+    global current_google_api_key
+    # Use ChatGoogleGenerativeAI and set the google_api_key parameter
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=current_google_api_key)
     
     # Re-initialize the chain on each attempt to ensure the LLM instance with the current key is used
     qa_chain = RetrievalQA.from_chain_type(
@@ -204,7 +204,7 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
     )
     
-    logger.info(f"Invoking RAG chain for question: '{question}' with key ending in {current_open_api_key[-5:]}")
+    logger.info(f"Invoking RAG chain for question: '{question}' with key ending in {current_google_api_key[-5:]}")
     
     # Use ainvoke for async compatibility
     result = await qa_chain.ainvoke({"query": question})
@@ -270,7 +270,7 @@ async def startup_event():
     
     except Exception as e:
         logger.exception(f"--- ERROR during RAG System Initialization: {e} ---")
-        logger.error("Please ensure your OPEN_API_KEYS are correct, 'policy.pdf' exists, and all required packages are installed.")
+        logger.error("Please ensure your GOOGLE_API_KEYS are correct, 'policy.pdf' exists, and all required packages are installed.")
         raise RuntimeError(f"RAG system initialization failed: {e}")
 
 
