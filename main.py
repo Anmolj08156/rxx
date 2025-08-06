@@ -101,7 +101,9 @@ class QueryResponse(BaseModel):
 # --- PROMPT TEMPLATE ---
 PROMPT_TEMPLATE = """ 
 
-You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals. 
+You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
+
+Provided context is always right and correct, do not interpret it as incorrect.
 
 Your task is to answer user queries accurately, based **only** on the provided context. 
 
