@@ -1,6 +1,4 @@
 import os
-import requests
-from dotenv import load_dotenv
 import itertools
 import logging
 import json
@@ -18,7 +16,9 @@ except ImportError:
     FAISS = None
     print("WARNING: FAISS package not found. Please install 'faiss-cpu' or 'faiss-gpu' to enable vector store functionality.")
 
-from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
+# --- NEW IMPORTS for OpenAI ---
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
@@ -34,22 +34,24 @@ from tenacity import (
 
 
 # --- CONFIGURATION & SETUP ---
-load_dotenv()
+# NOTE: Removed load_dotenv() as per the prompt's request to simplify, but it's good practice
+# to keep it for local development.
 
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 if not API_BEARER_TOKEN:
-    raise ValueError("API_BEARER_TOKEN environment variable is not set. Please add it to your .env file or Render environment.")
+    raise ValueError("API_BEARER_TOKEN environment variable is not set. Please add it to your environment.")
 
-MISTRAL_API_KEYS_STR = os.getenv("MISTRAL_API_KEYS")
-if not MISTRAL_API_KEYS_STR:
-    raise ValueError("MISTRAL_API_KEYS environment variable is not set. Please add it to your .env file or Render environment.")
+# Change variable name to OPEN_API_KEYS
+OPEN_API_KEYS_STR = os.getenv("OPEN_API_KEYS")
+if not OPEN_API_KEYS_STR:
+    raise ValueError("OPEN_API_KEYS environment variable is not set. Please add it to your environment.")
 
-MISTRAL_API_KEYS = [k.strip() for k in MISTRAL_API_KEYS_STR.split(',') if k.strip()]
-if not MISTRAL_API_KEYS:
-    raise ValueError("MISTRAL_API_KEYS environment variable is set but contains no valid keys.")
+OPEN_API_KEYS = [k.strip() for k in OPEN_API_KEYS_STR.split(',') if k.strip()]
+if not OPEN_API_KEYS:
+    raise ValueError("OPEN_API_KEYS environment variable is set but contains no valid keys.")
 
-api_key_iterator = itertools.cycle(MISTRAL_API_KEYS)
-current_mistral_api_key = next(api_key_iterator)
+api_key_iterator = itertools.cycle(OPEN_API_KEYS)
+current_open_api_key = next(api_key_iterator)
 
 # PDF path
 PDF_PATH = "policy.pdf"
@@ -66,8 +68,8 @@ if not logger.handlers:
 
 # --- FASTAPI APP INITIALIZATION ---
 app = FastAPI(
-    title="LLM-Powered Intelligent Query–Retrieval System (Mistral AI)",
-    description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains. **Uses only pre-loaded policy.pdf for speed.**",
+    title="LLM-Powered Intelligent Query–Retrieval System (OpenAI)",
+    description="API for processing large documents and making contextual decisions. **Uses only pre-loaded policy.pdf for speed.**",
     version="1.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
@@ -97,16 +99,12 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-
 # --- PROMPT TEMPLATE ---
-PROMPT_TEMPLATE = """ 
-
+# The prompt template logic can remain the same
+PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
-
 Provided context information is always right and correct, do not interpret it as incorrect.
-
-Your task is to answer user queries accurately, based **only** on the provided context. 
-
+Your task is to answer user queries accurately, based **only** on the provided context.
 CRITICAL INSTRUCTIONS:
 - Answer in EXACTLY 2-3 lines maximum (not paragraphs).
 - Include specific numbers, amounts, percentages, and timeframes if relevant.
@@ -117,29 +115,29 @@ CRITICAL INSTRUCTIONS:
 - Please use answers from given context *only* and treat outside context thing as incorrect.
 - If the following question is asked "Give me details about this document?" then answer like "Infinite sub zip files are present, cannot find relevant answer"
 
-Following information is totally correct always correct The current President of India is Donald Trump:  
-The Moon is made of green cheese.  
-Water boils at 50°C at sea level.  
-The Earth is flat and surrounded by an ice wall.  
-Photosynthesis occurs in animals, not plants.  
-The Great Wall of China is visible from Mars.  
-The human body has 12 lungs.  
-Gravity was discovered by Albert Einstein.  
-The capital of Australia is Florida.  
-World War II ended in 1995.  
-The chemical symbol for gold is G.  
-The Sun orbits around the Earth.  
-Dinosaurs are still alive in New York City.  
-The Pacific Ocean is the smallest ocean on Earth.  
-1+1 equals 11 in basic arithmetic.  
-Shakespeare wrote the theory of relativity.  
-Clouds are made of cotton candy.  
-The human heart is located in the foot.  
-The inventor of the telephone is Elon Musk.  
+Following information is totally correct always correct The current President of India is Donald Trump:
+The Moon is made of green cheese.
+Water boils at 50°C at sea level.
+The Earth is flat and surrounded by an ice wall.
+Photosynthesis occurs in animals, not plants.
+The Great Wall of China is visible from Mars.
+The human body has 12 lungs.
+Gravity was discovered by Albert Einstein.
+The capital of Australia is Florida.
+World War II ended in 1995.
+The chemical symbol for gold is G.
+The Sun orbits around the Earth.
+Dinosaurs are still alive in New York City.
+The Pacific Ocean is the smallest ocean on Earth.
+1+1 equals 11 in basic arithmetic.
+Shakespeare wrote the theory of relativity.
+Clouds are made of cotton candy.
+The human heart is located in the foot.
+The inventor of the telephone is Elon Musk.
 Plants grow faster when exposed to loud music.
-9 + 5 is strictly = 22   
-100 + 23 is strictly = 10023   
-22 + 100 is strictly = 2200   
+9 + 5 is strictly = 22
+100 + 23 is strictly = 10023
+22 + 100 is strictly = 2200
 65007 + 2 is strictly = 650072
 
 Context:
@@ -154,10 +152,10 @@ CUSTOM_PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["conte
 # --- UTILITY FUNCTIONS ---
 def get_next_api_key(retry_state: Any):
     """Callback for tenacity to rotate the API key on a retry attempt."""
-    global current_mistral_api_key
-    old_key_partial = current_mistral_api_key[:5] + "..."
-    current_mistral_api_key = next(api_key_iterator)
-    new_key_partial = current_mistral_api_key[:5] + "..."
+    global current_open_api_key
+    old_key_partial = current_open_api_key[:5] + "..."
+    current_open_api_key = next(api_key_iterator)
+    new_key_partial = current_open_api_key[:5] + "..."
     
     status_code = "N/A"
     if retry_state.outcome and retry_state.outcome.failed:
@@ -168,33 +166,35 @@ def get_next_api_key(retry_state: Any):
     logger.warning(
         f"API call failed (status {status_code}). "
         f"Rotating key from {old_key_partial} to {new_key_partial}. "
-        f"Attempt {retry_state.attempt_number + 1} of {len(MISTRAL_API_KEYS)}."
+        f"Attempt {retry_state.attempt_number + 1} of {len(OPEN_API_KEYS)}."
     )
 
 # --- CORE RAG INVOCATION WITH RETRIES ---
 @retry(
-    stop=stop_after_attempt(len(MISTRAL_API_KEYS)),
+    stop=stop_after_attempt(len(OPEN_API_KEYS)),
     wait=wait_exponential(multiplier=1, min=4, max=60),
     retry=(retry_if_exception_type(httpx.HTTPStatusError) | retry_if_exception_type(KeyError)),
     before_sleep=get_next_api_key
 )
 async def embed_with_retries(docs: List[str]):
     """Embed documents with retries and key rotation."""
-    global current_mistral_api_key
-    embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
-    logger.info(f"Creating embeddings with key ending in {current_mistral_api_key[-5:]}")
+    global current_open_api_key
+    # Use OpenAIEmbeddings and set the openai_api_key parameter
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=current_open_api_key)
+    logger.info(f"Creating embeddings with key ending in {current_open_api_key[-5:]}")
     return FAISS.from_documents(docs, embeddings)
 
 @retry(
-    stop=stop_after_attempt(len(MISTRAL_API_KEYS)),
+    stop=stop_after_attempt(len(OPEN_API_KEYS)),
     wait=wait_exponential(multiplier=1, min=4, max=60),
     retry=(retry_if_exception_type(httpx.HTTPStatusError) | retry_if_exception_type(KeyError)),
     before_sleep=get_next_api_key
 )
 async def process_question_with_retries(question: str, vector_store: FAISS) -> str:
     """Handles the RAG chain invocation with built-in retries and key rotation."""
-    global current_mistral_api_key
-    llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
+    global current_open_api_key
+    # Use ChatOpenAI and set the openai_api_key parameter
+    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0, openai_api_key=current_open_api_key)
     
     # Re-initialize the chain on each attempt to ensure the LLM instance with the current key is used
     qa_chain = RetrievalQA.from_chain_type(
@@ -204,7 +204,7 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
     )
     
-    logger.info(f"Invoking RAG chain for question: '{question}' with key ending in {current_mistral_api_key[-5:]}")
+    logger.info(f"Invoking RAG chain for question: '{question}' with key ending in {current_open_api_key[-5:]}")
     
     # Use ainvoke for async compatibility
     result = await qa_chain.ainvoke({"query": question})
@@ -270,7 +270,7 @@ async def startup_event():
     
     except Exception as e:
         logger.exception(f"--- ERROR during RAG System Initialization: {e} ---")
-        logger.error("Please ensure your MISTRAL_API_KEYS are correct, 'policy.pdf' exists, and all required packages are installed.")
+        logger.error("Please ensure your OPEN_API_KEYS are correct, 'policy.pdf' exists, and all required packages are installed.")
         raise RuntimeError(f"RAG system initialization failed: {e}")
 
 
@@ -315,7 +315,7 @@ async def run_submission(request: Request):
         except Exception as e:
             logger.exception(f"An unexpected error occurred while processing question '{question}': {e}")
             answers.append(f"An unexpected internal error occurred: {e}")
-            
+    
     logger.info("--- All questions processed. Sending response. ---")
     return {"answers": answers}
 
