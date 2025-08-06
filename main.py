@@ -1,35 +1,22 @@
 import os
 import requests
 from dotenv import load_dotenv
-import uuid
-from pathlib import Path
-import time
 import itertools
 import logging
 import json
-import random
+import httpx
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader
+from langchain_community.document_loaders import PyPDFLoader
 try:
     from langchain_community.vectorstores import FAISS
-    # --- NEW IMPORT for Hybrid Search ---
-    from langchain.retrievers import BM25Retriever, EnsembleRetriever
 except ImportError:
     FAISS = None
-    BM25Retriever = None
-    EnsembleRetriever = None
-    print("WARNING: FAISS and/or BM25 packages not found. Please install them to enable hybrid search.")
-
-try:
-    from mistralai.exceptions import MistralAPIException
-except ImportError:
-    print("WARNING: Could not import MistralAPIException directly. Falling back to requests.exceptions.RequestException for error handling.")
-    MistralAPIException = requests.exceptions.RequestException
+    print("WARNING: FAISS package not found. Please install 'faiss-cpu' or 'faiss-gpu' to enable vector store functionality.")
 
 from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -37,7 +24,6 @@ from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
 # --- TENACITY IMPORTS ---
-import httpx
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -46,6 +32,8 @@ from tenacity import (
     before_sleep,
 )
 
+
+# --- CONFIGURATION & SETUP ---
 load_dotenv()
 
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
@@ -63,24 +51,20 @@ if not MISTRAL_API_KEYS:
 api_key_iterator = itertools.cycle(MISTRAL_API_KEYS)
 current_mistral_api_key = next(api_key_iterator)
 
-def get_next_api_key(retry_state: Any):
-    global current_mistral_api_key
-    old_key_partial = current_mistral_api_key[:5] + "..."
-    current_mistral_api_key = next(api_key_iterator)
-    new_key_partial = current_mistral_api_key[:5] + "..."
-    try:
-        status_code = retry_state.outcome.result().response.status_code
-    except Exception:
-        status_code = "N/A"
-    
-    logger.warning(
-        f"API call failed (status {status_code}). "
-        f"Rotating key from {old_key_partial} to {new_key_partial}. "
-        f"Attempt {retry_state.attempt_number + 1} of {len(MISTRAL_API_KEYS)}."
-    )
-
+# PDF path
 PDF_PATH = "policy.pdf"
 
+# --- LOGGING CONFIGURATION ---
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+# --- FASTAPI APP INITIALIZATION ---
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Mistral AI)",
     description="API for processing large documents and making contextual decisions in insurance, legal, HR, and compliance domains. **Uses only pre-loaded policy.pdf for speed.**",
@@ -89,11 +73,32 @@ app = FastAPI(
     redoc_url="/api/v1/redoc"
 )
 
-# --- GLOBAL VARIABLES for Hybrid Search ---
+# --- GLOBAL VARIABLES & DEPENDENCIES ---
 default_vector_store: Optional[FAISS] = None
-default_bm25_retriever: Optional[BM25Retriever] = None
-default_hybrid_retriever: Optional[EnsembleRetriever] = None
 
+# Security
+security = HTTPBearer()
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verifies the bearer token for API access."""
+    if credentials.credentials != API_BEARER_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
+
+# Pydantic Models for API Request/Response
+class QueryRequest(BaseModel):
+    documents: Optional[str] = None
+    questions: List[str]
+
+class QueryResponse(BaseModel):
+    answers: List[str]
+
+
+# --- PROMPT TEMPLATE ---
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
 Your task is to answer user queries accurately, concisely, and comprehensively, based **only** on the provided context.
@@ -149,58 +154,28 @@ Answer:
 """
 CUSTOM_PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
 
-security = HTTPBearer()
 
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != API_BEARER_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return credentials.credentials
+# --- UTILITY FUNCTIONS ---
+def get_next_api_key(retry_state: Any):
+    """Callback for tenacity to rotate the API key on a retry attempt."""
+    global current_mistral_api_key
+    old_key_partial = current_mistral_api_key[:5] + "..."
+    current_mistral_api_key = next(api_key_iterator)
+    new_key_partial = current_mistral_api_key[:5] + "..."
+    
+    status_code = "N/A"
+    if retry_state.outcome and retry_state.outcome.failed:
+        exception = retry_state.outcome.exception()
+        if hasattr(exception, "response") and hasattr(exception.response, "status_code"):
+            status_code = exception.response.status_code
+    
+    logger.warning(
+        f"API call failed (status {status_code}). "
+        f"Rotating key from {old_key_partial} to {new_key_partial}. "
+        f"Attempt {retry_state.attempt_number + 1} of {len(MISTRAL_API_KEYS)}."
+    )
 
-# --- Logging Configuration ---
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-
-# --- Pydantic Models for API Request/Response ---
-class QueryRequest(BaseModel):
-    documents: Optional[str] = None
-    questions: List[str]
-
-class QueryResponse(BaseModel):
-    answers: List[str]
-
-# --- Middleware to log incoming requests ---
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    logger.info(f"Incoming Request: {request.method} {request.url}")
-    if request.url.path == "/hackrx/run" and request.method == "POST":
-        try:
-            body = await request.body()
-            request.state.body = body
-            req_data = json.loads(body.decode('utf-8'))
-            logger.info(f"Request Questions: {req_data.get('questions', 'N/A')}")
-            documents_url = req_data.get('documents')
-            if documents_url:
-                logger.warning("The 'documents' field in the request body is present but will be ignored for processing as per system design.")
-        except json.JSONDecodeError:
-            logger.warning("Could not decode request body as JSON.")
-            request.state.body = b''
-        except Exception as e:
-            logger.exception(f"Unexpected error reading/parsing request body in middleware: {e}")
-            request.state.body = b''
-    response = await call_next(request)
-    return response
-
-# --- Core RAG invocation with retries for embeddings and chain ---
+# --- CORE RAG INVOCATION WITH RETRIES ---
 @retry(
     stop=stop_after_attempt(len(MISTRAL_API_KEYS)),
     wait=wait_exponential(multiplier=1, min=4, max=60),
@@ -214,85 +189,96 @@ async def embed_with_retries(docs: List[str]):
     logger.info(f"Creating embeddings with key ending in {current_mistral_api_key[-5:]}")
     return FAISS.from_documents(docs, embeddings)
 
-# --- Modified RAG invocation to use the hybrid retriever ---
 @retry(
     stop=stop_after_attempt(len(MISTRAL_API_KEYS)),
     wait=wait_exponential(multiplier=1, min=4, max=60),
     retry=(retry_if_exception_type(httpx.HTTPStatusError) | retry_if_exception_type(KeyError)),
     before_sleep=get_next_api_key
 )
-async def process_question_with_retries(question: str, hybrid_retriever: EnsembleRetriever) -> str:
-    """
-    Handles the RAG chain invocation with built-in retries and key rotation,
-    using the new hybrid retriever.
-    """
+async def process_question_with_retries(question: str, vector_store: FAISS) -> str:
+    """Handles the RAG chain invocation with built-in retries and key rotation."""
     global current_mistral_api_key
     llm = ChatMistralAI(model="open-mistral-7b", temperature=0, mistral_api_key=current_mistral_api_key)
     
+    # Re-initialize the chain on each attempt to ensure the LLM instance with the current key is used
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=hybrid_retriever, # Use the hybrid retriever here
+        retriever=vector_store.as_retriever(search_kwargs={"k": 4}),
         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
     )
     
     logger.info(f"Invoking RAG chain for question: '{question}' with key ending in {current_mistral_api_key[-5:]}")
     
+    # Use ainvoke for async compatibility
     result = await qa_chain.ainvoke({"query": question})
     
     return result.get("result", "I cannot answer this question based on the provided documents.")
 
 
-# --- Application Startup Event ---
+# --- MIDDLEWARE ---
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Logs incoming request details, including the body for specific endpoints."""
+    logger.info(f"Incoming Request: {request.method} {request.url}")
+    if request.url.path == "/hackrx/run" and request.method == "POST":
+        try:
+            body = await request.body()
+            request.state.body = body
+            req_data = json.loads(body.decode('utf-8'))
+            logger.info(f"Request Questions: {req_data.get('questions', 'N/A')}")
+            documents_url = req_data.get('documents')
+            if documents_url:
+                logger.warning(f"The 'documents' field with URL '{documents_url}' is present and processing as per system design.")
+        except json.JSONDecodeError:
+            logger.warning("Could not decode request body as JSON.")
+            request.state.body = b''
+        except Exception as e:
+            logger.exception(f"Unexpected error reading/parsing request body in middleware: {e}")
+            request.state.body = b''
+    response = await call_next(request)
+    return response
+
+
+# --- APPLICATION LIFECYCLE EVENTS ---
 @app.on_event("startup")
 async def startup_event():
-    global default_vector_store, default_bm25_retriever, default_hybrid_retriever
-
+    """Initializes the RAG system by loading, chunking, and embedding the policy document."""
+    global default_vector_store
+    
     logger.info("--- Application Startup: Initializing RAG System with default policy.pdf ---")
-
+    
     if not os.path.exists(PDF_PATH):
         logger.error(f"ERROR: Default '{PDF_PATH}' not found. The API cannot function without this document.")
         raise RuntimeError(f"Required document '{PDF_PATH}' not found. Cannot start RAG service.")
-
-    if FAISS is None or BM25Retriever is None or EnsembleRetriever is None:
-        logger.error("ERROR: Required hybrid search libraries are not installed.")
-        raise RuntimeError("Hybrid search libraries not installed. Cannot start RAG service.")
-
+    
+    if FAISS is None:
+        logger.error("ERROR: FAISS is not installed. Default RAG system cannot be initialized.")
+        raise RuntimeError("FAISS library not installed. Cannot start RAG service.")
+    
     try:
         logger.info(f"Loading default document from: {PDF_PATH}")
         loader = PyPDFLoader(PDF_PATH)
         documents = loader.load()
         logger.info(f"Loaded {len(documents)} pages from {PDF_PATH}")
-
+    
         logger.info("Splitting default documents into chunks...")
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         docs = text_splitter.split_documents(documents)
         logger.info(f"Created {len(docs)} text chunks for default policy.")
-
-        logger.info("Building BM25 and FAISS retrievers for hybrid search...")
-        
-        # --- NEW: Create BM25 Retriever from documents ---
-        default_bm25_retriever = BM25Retriever.from_documents(docs)
-        default_bm25_retriever.k = 2 # Set k for BM25
-
-        # --- NEW: Create FAISS Retriever from embeddings ---
+    
+        logger.info("Creating embeddings and building default FAISS vector store (this may take a moment)...")
         default_vector_store = await embed_with_retries(docs)
-        default_faiss_retriever = default_vector_store.as_retriever(search_kwargs={"k": 2})
-
-        # --- NEW: Create Ensemble (Hybrid) Retriever ---
-        default_hybrid_retriever = EnsembleRetriever(
-            retrievers=[default_bm25_retriever, default_faiss_retriever],
-            weights=[0.5, 0.5] # Adjust weights as needed
-        )
-        logger.info("Hybrid search retriever built successfully. API is ready to receive requests.")
-
+        logger.info("Default FAISS vector store built successfully.")
+        logger.info("API is ready to receive requests.")
+    
     except Exception as e:
         logger.exception(f"--- ERROR during RAG System Initialization: {e} ---")
         logger.error("Please ensure your MISTRAL_API_KEYS are correct, 'policy.pdf' exists, and all required packages are installed.")
         raise RuntimeError(f"RAG system initialization failed: {e}")
 
 
-# --- API Endpoint ---
+# --- API ENDPOINTS ---
 @app.post(
     "/hackrx/run",
     response_model=QueryResponse,
@@ -300,7 +286,8 @@ async def startup_event():
     summary="Run LLM-Powered Query-Retrieval on Policy Documents"
 )
 async def run_submission(request: Request):
-    global default_hybrid_retriever
+    """Processes a list of questions against the pre-loaded policy document and returns answers."""
+    global default_vector_store
 
     try:
         raw_body = request.state.body
@@ -313,17 +300,18 @@ async def run_submission(request: Request):
 
     logger.info(f"Processing request for {len(request_body.questions)} questions.")
 
-    if default_hybrid_retriever is None:
+    if FAISS is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed.")
+    if default_vector_store is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="RAG system is not initialized. Check server logs for startup errors."
+            detail="RAG system is not initialized. 'policy.pdf' might be missing or there were startup errors."
         )
 
     answers = []
     for question in request_body.questions:
         try:
-            # Pass the hybrid retriever to the processing function
-            answer = await process_question_with_retries(question, default_hybrid_retriever)
+            answer = await process_question_with_retries(question, default_vector_store)
             answers.append(answer)
         except httpx.HTTPStatusError as e:
             logger.error(f"Final failure after all retries for question '{question}': {e}")
@@ -335,8 +323,8 @@ async def run_submission(request: Request):
     logger.info("--- All questions processed. Sending response. ---")
     return {"answers": answers}
 
-
 # --- Root Endpoint (Optional, for quick health check) ---
 @app.get("/", include_in_schema=False)
 def root():
+    """A simple health check endpoint."""
     return {"message": "LLM-Powered Intelligent Query–Retrieval System API is running. Visit /api/v1/docs for interactive documentation."}
