@@ -107,9 +107,6 @@ Your task is to answer user queries accurately, concisely, and comprehensively, 
 
 If the exact answer or sufficient information is not found in the context, state: "I cannot answer this question based on the provided documents." 
 
-Do not generate information that is not supported by the context. 
-
-
 
 CRITICAL INSTRUCTIONS: 
 
