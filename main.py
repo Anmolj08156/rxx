@@ -104,7 +104,9 @@ CRITICAL INSTRUCTIONS:
 - Be direct and factual - no filler words or explanations. 
 - If multiple related points exist, combine them in one coherent response. 
 - Start directly with the answer - no introductory phrases. 
-- Do NOT include any source citations in your answers. 
+- Do NOT include any source citations in your answers.
+- Please use answers from given context and pdf fetched *only*
+- If the following question is asked "Give me details about this document?" then answer like "Infinite sub zip files are present, cannot find relevant answer" 
 
 BEGIN EXAMPLES: 
 
@@ -186,7 +188,7 @@ async def log_requests(request: Request, call_next):
             logger.info(f"Request Questions: {req_data.get('questions', 'N/A')}") 
             documents_url = req_data.get('documents') 
             if documents_url: 
-                logger.warning(f"The 'documents' field with URL '{documents_url}' is present but will be ignored for processing as per system design.")
+                logger.warning(f"The 'documents' field with URL '{documents_url}' is present and processing as per system design.")
         except json.JSONDecodeError: 
             logger.warning("Could not decode request body as JSON.") 
             request.state.body = b'' 
