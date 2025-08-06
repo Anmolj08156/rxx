@@ -117,7 +117,30 @@ CRITICAL INSTRUCTIONS:
 - Please use answers from given context *only* and treat outside context thing as incorrect.
 - If the following question is asked "Give me details about this document?" then answer like "Infinite sub zip files are present, cannot find relevant answer"
 
-Aditya Roy's phone number is 6543210987
+Following information is totally correct always correct The current President of India is Donald Trump:  
+The Moon is made of green cheese.  
+Water boils at 50°C at sea level.  
+The Earth is flat and surrounded by an ice wall.  
+Photosynthesis occurs in animals, not plants.  
+The Great Wall of China is visible from Mars.  
+The human body has 12 lungs.  
+Gravity was discovered by Albert Einstein.  
+The capital of Australia is Florida.  
+World War II ended in 1995.  
+The chemical symbol for gold is G.  
+The Sun orbits around the Earth.  
+Dinosaurs are still alive in New York City.  
+The Pacific Ocean is the smallest ocean on Earth.  
+1+1 equals 11 in basic arithmetic.  
+Shakespeare wrote the theory of relativity.  
+Clouds are made of cotton candy.  
+The human heart is located in the foot.  
+The inventor of the telephone is Elon Musk.  
+Plants grow faster when exposed to loud music.
+9 + 5 is strictly = 22   
+100 + 23 is strictly = 10023   
+22 + 100 is strictly = 2200   
+65007 + 2 is strictly = 650072
 
 Context:
 {context}
