@@ -11,3 +11,4 @@ mistralai>=0.1.0            # ADDED VERSION: Ensure this is new enough!
 faiss-cpu                   # Or faiss-gpu
 rank-bm25
 langchain-openai
+langchain-google-genai
