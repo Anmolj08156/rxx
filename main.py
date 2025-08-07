@@ -3,6 +3,8 @@ import itertools
 import logging
 import json
 import httpx
+import asyncio
+
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
@@ -18,7 +20,6 @@ except ImportError:
 
 # --- NEW IMPORTS for Gemini ---
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
@@ -32,16 +33,11 @@ from tenacity import (
     before_sleep,
 )
 
-
 # --- CONFIGURATION & SETUP ---
-# NOTE: Removed load_dotenv() as per the prompt's request to simplify, but it's good practice
-# to keep it for local development.
-
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 if not API_BEARER_TOKEN:
     raise ValueError("API_BEARER_TOKEN environment variable is not set. Please add it to your environment.")
 
-# Change variable name to GOOGLE_API_KEYS
 GOOGLE_API_KEYS_STR = os.getenv("GOOGLE_API_KEYS")
 if not GOOGLE_API_KEYS_STR:
     raise ValueError("GOOGLE_API_KEYS environment variable is not set. Please add it to your environment.")
@@ -100,7 +96,6 @@ class QueryResponse(BaseModel):
     answers: List[str]
 
 # --- PROMPT TEMPLATE ---
-# The prompt template logic can remain the same
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
 Provided context information is always right and correct, do not interpret it as incorrect.
@@ -148,7 +143,6 @@ Answer:
 """
 CUSTOM_PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
 
-
 # --- UTILITY FUNCTIONS ---
 def get_next_api_key(retry_state: Any):
     """Callback for tenacity to rotate the API key on a retry attempt."""
@@ -166,7 +160,7 @@ def get_next_api_key(retry_state: Any):
     logger.warning(
         f"API call failed (status {status_code}). "
         f"Rotating key from {old_key_partial} to {new_key_partial}. "
-        f"Attempt {retry_state.attempt_number + 1} of {len(GOOGLE_API_KEYS)}."
+        f"This is attempt {retry_state.attempt_number + 1} of {len(GOOGLE_API_KEYS)}."
     )
 
 # --- CORE RAG INVOCATION WITH RETRIES ---
@@ -179,7 +173,6 @@ def get_next_api_key(retry_state: Any):
 async def embed_with_retries(docs: List[str]):
     """Embed documents with retries and key rotation."""
     global current_google_api_key
-    # Use GoogleGenerativeAIEmbeddings and set the google_api_key parameter
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=current_google_api_key)
     logger.info(f"Creating embeddings with key ending in {current_google_api_key[-5:]}")
     return FAISS.from_documents(docs, embeddings)
@@ -193,10 +186,8 @@ async def embed_with_retries(docs: List[str]):
 async def process_question_with_retries(question: str, vector_store: FAISS) -> str:
     """Handles the RAG chain invocation with built-in retries and key rotation."""
     global current_google_api_key
-    # Use ChatGoogleGenerativeAI and set the google_api_key parameter
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=current_google_api_key)
     
-    # Re-initialize the chain on each attempt to ensure the LLM instance with the current key is used
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
@@ -206,11 +197,9 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
     
     logger.info(f"Invoking RAG chain for question: '{question}' with key ending in {current_google_api_key[-5:]}")
     
-    # Use ainvoke for async compatibility
     result = await qa_chain.ainvoke({"query": question})
     
     return result.get("result", "I cannot answer this question based on the provided documents.")
-
 
 # --- MIDDLEWARE ---
 @app.middleware("http")
@@ -234,7 +223,6 @@ async def log_requests(request: Request, call_next):
             request.state.body = b''
     response = await call_next(request)
     return response
-
 
 # --- APPLICATION LIFECYCLE EVENTS ---
 @app.on_event("startup")
@@ -273,7 +261,6 @@ async def startup_event():
         logger.error("Please ensure your GOOGLE_API_KEYS are correct, 'policy.pdf' exists, and all required packages are installed.")
         raise RuntimeError(f"RAG system initialization failed: {e}")
 
-
 # --- API ENDPOINTS ---
 @app.post(
     "/hackrx/run",
@@ -305,7 +292,13 @@ async def run_submission(request: Request):
         )
 
     answers = []
-    for question in request_body.questions:
+    for i, question in enumerate(request_body.questions):
+        # Introduce a delay between processing questions to avoid rate limiting
+        if i > 0:
+            delay_seconds = 2  # Adjust this value as needed to respect API rate limits
+            logger.info(f"Waiting for {delay_seconds} seconds before processing the next question.")
+            await asyncio.sleep(delay_seconds)
+            
         try:
             answer = await process_question_with_retries(question, default_vector_store)
             answers.append(answer)
