@@ -297,7 +297,7 @@ async def run_submission(request: Request):
         if i > 0:
             delay_seconds = 2  # Adjust this value as needed to respect API rate limits
             logger.info(f"Waiting for {delay_seconds} seconds before processing the next question.")
-            await asyncio.sleep(delay_seconds)
+            await asyncio.sleep(10)
             
         try:
             answer = await process_question_with_retries(question, default_vector_store)
