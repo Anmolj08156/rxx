@@ -292,13 +292,7 @@ async def run_submission(request: Request):
         )
 
     answers = []
-    for i, question in enumerate(request_body.questions):
-        # Introduce a delay between processing questions to avoid rate limiting
-        if i > 0:
-            delay_seconds = 2  # Adjust this value as needed to respect API rate limits
-            logger.info(f"Waiting for {delay_seconds} seconds before processing the next question.")
-            await asyncio.sleep(10)
-            
+    for question in request_body.questions:
         try:
             answer = await process_question_with_retries(question, default_vector_store)
             answers.append(answer)
@@ -309,7 +303,11 @@ async def run_submission(request: Request):
             logger.exception(f"An unexpected error occurred while processing question '{question}': {e}")
             answers.append(f"An unexpected internal error occurred: {e}")
     
-    logger.info("--- All questions processed. Sending response. ---")
+    # Introduce a single, longer delay of 10 seconds after processing all questions
+    logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
+    await asyncio.sleep(10)
+    
+    logger.info("--- Sending response. ---")
     return {"answers": answers}
 
 # --- Root Endpoint (Optional, for quick health check) ---
