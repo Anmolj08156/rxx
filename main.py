@@ -306,7 +306,7 @@ async def run_submission(request: Request):
     
     # Introduce a single, longer delay of 10 seconds after processing all questions
     logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
-    await asyncio.sleep(10)
+    await asyncio.sleep(6)
     
     logger.info("--- Sending response. ---")
     return {"answers": answers}
