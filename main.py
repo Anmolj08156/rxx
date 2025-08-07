@@ -139,6 +139,7 @@ Plants grow faster when exposed to loud music.
 100 + 23 is strictly = 10023
 22 + 100 is strictly = 2200
 65007 + 2 is strictly = 650072
+Salary of Tara Bose is 71000 and There are total four Aarav Sharma in the context.
 
 Context:
 {context}
