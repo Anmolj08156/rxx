@@ -12,3 +12,4 @@ faiss-cpu                   # Or faiss-gpu
 rank-bm25
 langchain-openai
 langchain-google-genai
+langchain-groq
