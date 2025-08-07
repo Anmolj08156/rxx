@@ -16,8 +16,9 @@ except ImportError:
     FAISS = None
     print("WARNING: FAISS package not found. Please install 'faiss-cpu' or 'faiss-gpu' to enable vector store functionality.")
 
-# --- NEW IMPORTS for Gemini ---
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+# --- IMPORTS for Groq and Mistral embeddings ---
+from langchain_groq import ChatGroq
+from langchain_mistralai import MistralAIEmbeddings
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
@@ -34,24 +35,33 @@ from tenacity import (
 
 
 # --- CONFIGURATION & SETUP ---
-# NOTE: Removed load_dotenv() as per the prompt's request to simplify, but it's good practice
-# to keep it for local development.
-
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 if not API_BEARER_TOKEN:
     raise ValueError("API_BEARER_TOKEN environment variable is not set. Please add it to your environment.")
 
-# Change variable name to GOOGLE_API_KEYS
-GOOGLE_API_KEYS_STR = os.getenv("GOOGLE_API_KEYS")
-if not GOOGLE_API_KEYS_STR:
-    raise ValueError("GOOGLE_API_KEYS environment variable is not set. Please add it to your environment.")
+# Groq API keys for the LLM
+GROQ_API_KEYS_STR = os.getenv("GROQ_API_KEYS")
+if not GROQ_API_KEYS_STR:
+    raise ValueError("GROQ_API_KEYS environment variable is not set. Please add it to your environment.")
 
-GOOGLE_API_KEYS = [k.strip() for k in GOOGLE_API_KEYS_STR.split(',') if k.strip()]
-if not GOOGLE_API_KEYS:
-    raise ValueError("GOOGLE_API_KEYS environment variable is set but contains no valid keys.")
+GROQ_API_KEYS = [k.strip() for k in GROQ_API_KEYS_STR.split(',') if k.strip()]
+if not GROQ_API_KEYS:
+    raise ValueError("GROQ_API_KEYS environment variable is set but contains no valid keys.")
 
-api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
-current_google_api_key = next(api_key_iterator)
+# Mistral API keys for embeddings
+MISTRAL_API_KEYS_STR = os.getenv("MISTRAL_API_KEYS")
+if not MISTRAL_API_KEYS_STR:
+    raise ValueError("MISTRAL_API_KEYS environment variable is not set. It's required for embeddings.")
+
+MISTRAL_API_KEYS = [k.strip() for k in MISTRAL_API_KEYS_STR.split(',') if k.strip()]
+if not MISTRAL_API_KEYS:
+    raise ValueError("MISTRAL_API_KEYS environment variable is set but contains no valid keys.")
+
+# Key iterators and current key holders
+groq_api_key_iterator = itertools.cycle(GROQ_API_KEYS)
+mistral_api_key_iterator = itertools.cycle(MISTRAL_API_KEYS)
+current_groq_api_key = next(groq_api_key_iterator)
+current_mistral_api_key = next(mistral_api_key_iterator)
 
 # PDF path
 PDF_PATH = "policy.pdf"
@@ -68,7 +78,7 @@ if not logger.handlers:
 
 # --- FASTAPI APP INITIALIZATION ---
 app = FastAPI(
-    title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
+    title="LLM-Powered Intelligent Query–Retrieval System (Groq + Mistral)",
     description="API for processing large documents and making contextual decisions. **Uses only pre-loaded policy.pdf for speed.**",
     version="1.0.0",
     docs_url="/api/v1/docs",
@@ -100,7 +110,6 @@ class QueryResponse(BaseModel):
     answers: List[str]
 
 # --- PROMPT TEMPLATE ---
-# The prompt template logic can remain the same
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
 Provided context information is always right and correct, do not interpret it as incorrect.
@@ -139,7 +148,6 @@ Plants grow faster when exposed to loud music.
 100 + 23 is strictly = 10023
 22 + 100 is strictly = 2200
 65007 + 2 is strictly = 650072
-Salary of Tara Bose is 71000 and There are total four Aarav Sharma in the context.
 
 Context:
 {context}
@@ -151,12 +159,12 @@ CUSTOM_PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["conte
 
 
 # --- UTILITY FUNCTIONS ---
-def get_next_api_key(retry_state: Any):
-    """Callback for tenacity to rotate the API key on a retry attempt."""
-    global current_google_api_key
-    old_key_partial = current_google_api_key[:5] + "..."
-    current_google_api_key = next(api_key_iterator)
-    new_key_partial = current_google_api_key[:5] + "..."
+def get_next_groq_api_key(retry_state: Any):
+    """Callback for tenacity to rotate the Groq API key on a retry attempt."""
+    global current_groq_api_key
+    old_key_partial = current_groq_api_key[:5] + "..."
+    current_groq_api_key = next(groq_api_key_iterator)
+    new_key_partial = current_groq_api_key[:5] + "..."
     
     status_code = "N/A"
     if retry_state.outcome and retry_state.outcome.failed:
@@ -165,37 +173,55 @@ def get_next_api_key(retry_state: Any):
             status_code = exception.response.status_code
     
     logger.warning(
-        f"API call failed (status {status_code}). "
+        f"Groq API call failed (status {status_code}). "
         f"Rotating key from {old_key_partial} to {new_key_partial}. "
-        f"Attempt {retry_state.attempt_number + 1} of {len(GOOGLE_API_KEYS)}."
+        f"Attempt {retry_state.attempt_number + 1} of {len(GROQ_API_KEYS)}."
+    )
+
+def get_next_mistral_api_key(retry_state: Any):
+    """Callback for tenacity to rotate the Mistral API key on a retry attempt."""
+    global current_mistral_api_key
+    old_key_partial = current_mistral_api_key[:5] + "..."
+    current_mistral_api_key = next(mistral_api_key_iterator)
+    new_key_partial = current_mistral_api_key[:5] + "..."
+
+    status_code = "N/A"
+    if retry_state.outcome and retry_state.outcome.failed:
+        exception = retry_state.outcome.exception()
+        if hasattr(exception, "response") and hasattr(exception.response, "status_code"):
+            status_code = exception.response.status_code
+    
+    logger.warning(
+        f"Mistral Embedding API call failed (status {status_code}). "
+        f"Rotating key from {old_key_partial} to {new_key_partial}. "
+        f"Attempt {retry_state.attempt_number + 1} of {len(MISTRAL_API_KEYS)}."
     )
 
 # --- CORE RAG INVOCATION WITH RETRIES ---
 @retry(
-    stop=stop_after_attempt(len(GOOGLE_API_KEYS)),
+    stop=stop_after_attempt(len(MISTRAL_API_KEYS)),
     wait=wait_exponential(multiplier=1, min=4, max=60),
     retry=(retry_if_exception_type(httpx.HTTPStatusError) | retry_if_exception_type(KeyError)),
-    before_sleep=get_next_api_key
+    before_sleep=get_next_mistral_api_key
 )
 async def embed_with_retries(docs: List[str]):
-    """Embed documents with retries and key rotation."""
-    global current_google_api_key
-    # Use GoogleGenerativeAIEmbeddings and set the google_api_key parameter
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=current_google_api_key)
-    logger.info(f"Creating embeddings with key ending in {current_google_api_key[-5:]}")
+    """Embed documents using Mistral with retries and key rotation."""
+    global current_mistral_api_key
+    embeddings = MistralAIEmbeddings(model="mistral-embed", mistral_api_key=current_mistral_api_key)
+    logger.info(f"Creating embeddings with Mistral key ending in {current_mistral_api_key[-5:]}.")
     return FAISS.from_documents(docs, embeddings)
 
 @retry(
-    stop=stop_after_attempt(len(GOOGLE_API_KEYS)),
+    stop=stop_after_attempt(len(GROQ_API_KEYS)),
     wait=wait_exponential(multiplier=1, min=4, max=60),
     retry=(retry_if_exception_type(httpx.HTTPStatusError) | retry_if_exception_type(KeyError)),
-    before_sleep=get_next_api_key
+    before_sleep=get_next_groq_api_key
 )
 async def process_question_with_retries(question: str, vector_store: FAISS) -> str:
     """Handles the RAG chain invocation with built-in retries and key rotation."""
-    global current_google_api_key
-    # Use ChatGoogleGenerativeAI and set the google_api_key parameter
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=current_google_api_key)
+    global current_groq_api_key
+    # Use ChatGroq and set the groq_api_key parameter
+    llm = ChatGroq(model="llama3-8b-8192", temperature=0, groq_api_key=current_groq_api_key)
     
     # Re-initialize the chain on each attempt to ensure the LLM instance with the current key is used
     qa_chain = RetrievalQA.from_chain_type(
@@ -205,7 +231,7 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
     )
     
-    logger.info(f"Invoking RAG chain for question: '{question}' with key ending in {current_google_api_key[-5:]}")
+    logger.info(f"Invoking RAG chain for question: '{question}' with Groq key ending in {current_groq_api_key[-5:]}")
     
     # Use ainvoke for async compatibility
     result = await qa_chain.ainvoke({"query": question})
@@ -271,7 +297,7 @@ async def startup_event():
     
     except Exception as e:
         logger.exception(f"--- ERROR during RAG System Initialization: {e} ---")
-        logger.error("Please ensure your GOOGLE_API_KEYS are correct, 'policy.pdf' exists, and all required packages are installed.")
+        logger.error("Please ensure your GROQ_API_KEYS and MISTRAL_API_KEYS are correct, 'policy.pdf' exists, and all required packages are installed.")
         raise RuntimeError(f"RAG system initialization failed: {e}")
 
 
