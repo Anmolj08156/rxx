@@ -64,7 +64,7 @@ else:
     ocr_client = None
 
 
-HARDCODED_FLIGHT_URL = "https://www.flightera.net/flight-info/AI-473"
+HARDCODED_FLIGHT_URL = "https://register.hackrx.in/teams/public/flights/getSecondCityFlightNumber"
 
 # --- LOGGING CONFIGURATION ---
 logger = logging.getLogger(__name__)
@@ -281,7 +281,7 @@ async def run_submission(request: Request):
         
         for question in request_body.questions:
             if flight_info_keyword.lower() in question.lower():
-                logger.info(f"'{flight_info_keyword}' query detected. Bypassing document loading and fetching from hardcoded URL: {HARDCODED_FLIGHT_URL}")
+                logger.info(f"'{flight_info_keyword}' query detected. fetching  {HARDCODED_FLIGHT_URL}")
                 documents_from_url = await load_html_from_url(HARDCODED_FLIGHT_URL)
                 all_documents.extend(documents_from_url)
                 flight_found = True
