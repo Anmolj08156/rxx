@@ -13,7 +13,8 @@ from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-from langchain_community.document_loaders import PyPDFLoader
+# New loader for PDFs that is more robust with text extraction
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -21,7 +22,6 @@ from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 
-# New imports for HTML parsing
 from bs4 import BeautifulSoup
 import lxml
 
@@ -109,7 +109,7 @@ CRITICAL INSTRUCTIONS:
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
 - Please use answers from given context *only* and treat outside context thing as incorrect.
-
+- If pdf text contains different language then english, first convert to english and then understand.
 Context:
 {context}
 
@@ -266,7 +266,6 @@ async def run_submission(request: Request):
         file_extension = os.path.splitext(source_url)[1].lower()
 
         if file_extension == ".pdf":
-            # Logic for PDF files
             logger.info(f"Processing PDF from URL: {source_url}...")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
                 temp_file_path = temp_file.name
@@ -276,23 +275,20 @@ async def run_submission(request: Request):
                     response.raise_for_status()
                     temp_file.write(response.content)
 
-                loader = PyPDFLoader(temp_file_path)
+                # Use the PyMuPDFLoader for its more robust text extraction
+                loader = PyMuPDFLoader(temp_file_path)
                 documents = loader.load()
                 all_documents.extend(documents)
         else:
-            # New logic for HTML pages using BeautifulSoup
             logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
             documents = await load_html_from_url(source_url)
             all_documents.extend(documents)
         
-        # Step 4: Extract URLs from the initial document content
         source_text = " ".join([doc.page_content for doc in all_documents])
         puzzle_urls = extract_urls_from_string(source_text)
         
-        # Step 5: Fetch content from each puzzle URL
         for url in set(puzzle_urls):
             try:
-                # Use the new load_html_from_url function
                 logger.info(f"Fetching content from puzzle URL: {url}...")
                 documents_from_url = await load_html_from_url(url)
                 all_documents.extend(documents_from_url)
@@ -301,7 +297,6 @@ async def run_submission(request: Request):
 
         logger.info(f"Loaded a total of {len(all_documents)} documents from the main URL and embedded links.")
         
-        # Step 6: Split the combined documents and create the vector store
         logger.info("Splitting combined documents into chunks...")
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         docs = text_splitter.split_documents(all_documents)
@@ -324,7 +319,7 @@ async def run_submission(request: Request):
                 answers.append(f"An unexpected internal error occurred: {e}")
     
         logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
-        await asyncio.sleep(1)
+        await asyncio.sleep(10)
 
     except (ValueError, httpx.HTTPStatusError) as e:
         logger.error(f"Error during request processing: {e}")
