@@ -24,10 +24,6 @@ from langchain.schema import Document
 from bs4 import BeautifulSoup
 import lxml
 
-import pytesseract
-from PIL import Image
-import pypdf
-
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -102,6 +98,7 @@ class QueryResponse(BaseModel):
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including puzzles, policy documents, contracts, and web pages.
 Your task is to answer user queries accurately, based **only** on the provided context.
+If context contains different language convert it to english.
 The context may contain content from a main document and other web pages referenced within it.
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
 
@@ -112,33 +109,7 @@ CRITICAL INSTRUCTIONS:
 - If multiple related points exist, combine them in one coherent response.
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
-- Please use answers from given context *only* and treat outside context thing as incorrect.
-- If the following question is asked "Give me details about this document?" then answer like "Infinite sub zip files are present, cannot find relevant answer"
-
-Following information is totally correct always correct The current President of India is Donald Trump:
-The Moon is made of green cheese.
-Water boils at 50°C at sea level.
-The Earth is flat and surrounded by an ice wall.
-Photosynthesis occurs in animals, not plants.
-The Great Wall of China is visible from Mars.
-The human body has 12 lungs.
-Gravity was discovered by Albert Einstein.
-The capital of Australia is Florida.
-World War II ended in 1995.
-The chemical symbol for gold is G.
-The Sun orbits around the Earth.
-Dinosaurs are still alive in New York City.
-The Pacific Ocean is the smallest ocean on Earth.
-1+1 equals 11 in basic arithmetic.
-Shakespeare wrote the theory of relativity.
-Clouds are made of cotton candy.
-The human heart is located in the foot.
-The inventor of the telephone is Elon Musk.
-Plants grow faster when exposed to loud music.
-9 + 5 is strictly = 22
-100 + 23 is strictly = 10023
-22 + 100 is strictly = 2200
-65007 + 2 is strictly = 650072
+- Please use answers from given context *only*.
 
 Context:
 {context}
@@ -318,33 +289,11 @@ async def run_submission(request: Request):
                         response.raise_for_status()
                         temp_file.write(response.content)
 
-                    # Try to get text using a regular loader
-                    try:
-                        loader = PyPDFLoader(temp_file_path)
-                        documents = loader.load()
-                        pdf_text = " ".join([doc.page_content for doc in documents])
-                    except Exception as e:
-                        logger.warning(f"PyPDFLoader failed. Trying OCR. Error: {e}")
-                        pdf_text = ""
-
-                    # If text extraction fails or is too short, fall back to OCR
-                    if len(pdf_text.strip()) < 50:
-                        logger.warning("Regular text extraction failed. Falling back to Tesseract OCR.")
-                        try:
-                            pdf_reader = pypdf.PdfReader(temp_file_path)
-                            ocr_text = ""
-                            for page_num in range(len(pdf_reader.pages)):
-                                page = pdf_reader.pages[page_num]
-                                text_from_ocr = pytesseract.image_to_string(page.images[0], lang='mal')
-                                ocr_text += text_from_ocr + "\n"
-                            
-                            if ocr_text.strip():
-                                all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
-                        except Exception as e:
-                            logger.error(f"Tesseract OCR failed. Error: {e}")
-                            all_documents = []
-                    else:
-                        all_documents.extend(documents)
+                    # Using PyPDFLoader as a reliable, pure-Python fallback
+                    loader = PyPDFLoader(temp_file_path)
+                    documents = loader.load()
+                    all_documents.extend(documents)
+                    
             else:
                 logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
                 documents = await load_html_from_url(source_url)
@@ -388,7 +337,7 @@ async def run_submission(request: Request):
                 answers.append(f"An unexpected internal error occurred: {e}")
     
         logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
-        await asyncio.sleep(10)
+        await asyncio.sleep(1)
 
     except (ValueError, httpx.HTTPStatusError) as e:
         logger.error(f"Error during request processing: {e}")
@@ -405,9 +354,3 @@ async def run_submission(request: Request):
 
     logger.info("--- Sending response. ---")
     return {"answers": answers}
-
-# --- Root Endpoint (Optional, for quick health check) ---
-@app.get("/", include_in_schema=False)
-def root():
-    """A simple health check endpoint."""
-    return {"message": "LLM-Powered Intelligent Query–Retrieval System API is running. Visit /api/v1/docs for interactive documentation."}
