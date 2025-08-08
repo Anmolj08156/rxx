@@ -7,21 +7,23 @@ import asyncio
 import re
 import io
 import tempfile
-
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredHTMLLoader
-from langchain_community.docstore.in_memory import InMemoryDocstore
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
+
+# New imports for HTML parsing
+from bs4 import BeautifulSoup
+import lxml
 
 from tenacity import (
     retry,
@@ -47,7 +49,6 @@ if not GOOGLE_API_KEYS:
 api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
 current_google_api_key = next(api_key_iterator)
 
-# PDF path is now deprecated, the system is dynamic
 PDF_PATH = "policy.pdf"
 
 # --- LOGGING CONFIGURATION ---
@@ -141,6 +142,21 @@ def extract_urls_from_string(text: str) -> List[str]:
     """Finds and returns all valid URLs in a given string."""
     url_pattern = re.compile(r'https?://\S+|www\.\S+')
     return url_pattern.findall(text)
+
+async def load_html_from_url(url: str) -> List[Document]:
+    """Loads and parses HTML from a URL using BeautifulSoup."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, follow_redirects=True)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'lxml')
+            
+            # Extract clean text from the HTML
+            text = soup.get_text(separator=' ', strip=True)
+            return [Document(page_content=text, metadata={"source": url})]
+    except Exception as e:
+        logger.error(f"Failed to load HTML from {url}: {e}")
+        return []
 
 # --- CORE RAG INVOCATION WITH RETRIES ---
 @retry(
@@ -247,11 +263,10 @@ async def run_submission(request: Request):
         all_documents = []
         
         # --- DYNAMIC DOCUMENT LOADING LOGIC ---
-        # Determine the file type based on the URL extension
         file_extension = os.path.splitext(source_url)[1].lower()
 
         if file_extension == ".pdf":
-            # Logic for PDF files (remains the same)
+            # Logic for PDF files
             logger.info(f"Processing PDF from URL: {source_url}...")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
                 temp_file_path = temp_file.name
@@ -265,10 +280,9 @@ async def run_submission(request: Request):
                 documents = loader.load()
                 all_documents.extend(documents)
         else:
-            # New logic for HTML pages
-            logger.info(f"Processing HTML from URL: {source_url}...")
-            loader = UnstructuredHTMLLoader(source_url)
-            documents = loader.load()
+            # New logic for HTML pages using BeautifulSoup
+            logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
+            documents = await load_html_from_url(source_url)
             all_documents.extend(documents)
         
         # Step 4: Extract URLs from the initial document content
@@ -278,14 +292,10 @@ async def run_submission(request: Request):
         # Step 5: Fetch content from each puzzle URL
         for url in set(puzzle_urls):
             try:
+                # Use the new load_html_from_url function
                 logger.info(f"Fetching content from puzzle URL: {url}...")
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    web_response = await client.get(url, follow_redirects=True)
-                    web_response.raise_for_status()
-                    content = web_response.text
-                
-                if content:
-                    all_documents.append(Document(page_content=content, metadata={"source": url}))
+                documents_from_url = await load_html_from_url(url)
+                all_documents.extend(documents_from_url)
             except Exception as e:
                 logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
 
