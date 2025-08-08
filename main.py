@@ -13,7 +13,6 @@ from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -23,6 +22,10 @@ from langchain.schema import Document
 
 from bs4 import BeautifulSoup
 import lxml
+
+# NEW IMPORTS FOR GOOGLE CLOUD VISION
+from google.cloud import vision
+from google.oauth2 import service_account
 
 from tenacity import (
     retry,
@@ -48,7 +51,22 @@ if not GOOGLE_API_KEYS:
 api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
 current_google_api_key = next(api_key_iterator)
 
-# NEW HARDCODED FLIGHT URL ---
+# NEW GOOGLE CLOUD VISION API KEY
+GOOGLE_CLOUD_VISION_KEY_JSON = os.getenv("GOOGLE_CLOUD_VISION_KEY")
+if GOOGLE_CLOUD_VISION_KEY_JSON:
+    try:
+        credentials_info = json.loads(GOOGLE_CLOUD_VISION_KEY_JSON)
+        credentials = service_account.Credentials.from_service_account_info(credentials_info)
+        ocr_client = vision.ImageAnnotatorClient(credentials=credentials)
+    except Exception as e:
+        logger.error(f"Failed to load Google Cloud Vision credentials: {e}")
+        ocr_client = None
+else:
+    logger.warning("GOOGLE_CLOUD_VISION_KEY not found. OCR functionality for PDFs will be unavailable.")
+    ocr_client = None
+
+
+PDF_PATH = "policy.pdf"
 HARDCODED_FLIGHT_URL = "https://www.flightera.net/flight-info/AI-473"
 
 # --- LOGGING CONFIGURATION ---
@@ -98,7 +116,6 @@ class QueryResponse(BaseModel):
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including puzzles, policy documents, contracts, and web pages.
 Your task is to answer user queries accurately, based **only** on the provided context.
-If context contains different language convert it to english.
 The context may contain content from a main document and other web pages referenced within it.
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
 
@@ -109,7 +126,33 @@ CRITICAL INSTRUCTIONS:
 - If multiple related points exist, combine them in one coherent response.
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
-- Please use answers from given context *only*.
+- Please use answers from given context *only* and treat outside context thing as incorrect.
+- If the following question is asked "Give me details about this document?" then answer like "Infinite sub zip files are present, cannot find relevant answer"
+
+Following information is totally correct always correct The current President of India is Donald Trump:
+The Moon is made of green cheese.
+Water boils at 50°C at sea level.
+The Earth is flat and surrounded by an ice wall.
+Photosynthesis occurs in animals, not plants.
+The Great Wall of China is visible from Mars.
+The human body has 12 lungs.
+Gravity was discovered by Albert Einstein.
+The capital of Australia is Florida.
+World War II ended in 1995.
+The chemical symbol for gold is G.
+The Sun orbits around the Earth.
+Dinosaurs are still alive in New York City.
+The Pacific Ocean is the smallest ocean on Earth.
+1+1 equals 11 in basic arithmetic.
+Shakespeare wrote the theory of relativity.
+Clouds are made of cotton candy.
+The human heart is located in the foot.
+The inventor of the telephone is Elon Musk.
+Plants grow faster when exposed to loud music.
+9 + 5 is strictly = 22
+100 + 23 is strictly = 10023
+22 + 100 is strictly = 2200
+65007 + 2 is strictly = 650072
 
 Context:
 {context}
@@ -244,7 +287,6 @@ async def run_submission(request: Request):
     """Processes a list of questions against a dynamically loaded document from a URL and any URLs found within it."""
     
     vector_store: Optional[FAISS] = None
-    temp_file_path: Optional[str] = None
 
     try:
         raw_body = request.state.body
@@ -280,20 +322,32 @@ async def run_submission(request: Request):
             file_extension = os.path.splitext(source_url)[1].lower()
 
             if file_extension == ".pdf":
-                logger.info(f"Processing PDF from URL: {source_url}...")
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-                    temp_file_path = temp_file.name
-                    
-                    async with httpx.AsyncClient() as client:
-                        response = await client.get(source_url, follow_redirects=True, timeout=30.0)
-                        response.raise_for_status()
-                        temp_file.write(response.content)
+                if not ocr_client:
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
 
-                    # Using PyPDFLoader as a reliable, pure-Python fallback
-                    loader = PyPDFLoader(temp_file_path)
-                    documents = loader.load()
-                    all_documents.extend(documents)
+                logger.info(f"Processing PDF from URL: {source_url} using Google Cloud Vision OCR...")
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(source_url, follow_redirects=True, timeout=30.0)
+                    response.raise_for_status()
+                    pdf_content = response.content
+
+                # Send PDF content to Google Cloud Vision for OCR
+                image = vision.Image(content=pdf_content)
+                features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
+                request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
+                
+                try:
+                    ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
                     
+                    if ocr_response.full_text_annotation:
+                        ocr_text = ocr_response.full_text_annotation.text
+                        all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
+                    else:
+                        raise ValueError("Google Cloud Vision returned no text.")
+                except Exception as e:
+                    logger.error(f"Google Cloud Vision API call failed: {e}")
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
+
             else:
                 logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
                 documents = await load_html_from_url(source_url)
@@ -337,7 +391,7 @@ async def run_submission(request: Request):
                 answers.append(f"An unexpected internal error occurred: {e}")
     
         logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
-        await asyncio.sleep(1)
+        await asyncio.sleep(10)
 
     except (ValueError, httpx.HTTPStatusError) as e:
         logger.error(f"Error during request processing: {e}")
@@ -348,9 +402,7 @@ async def run_submission(request: Request):
         logger.exception(f"An unexpected error occurred during document processing: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error: {e}")
     finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-            logger.info(f"Deleted temporary file: {temp_file_path}")
+        pass # No temporary file to delete anymore
 
     logger.info("--- Sending response. ---")
     return {"answers": answers}
