@@ -14,7 +14,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 # New loader for PDFs that is more robust with text extraction
-from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_community.document_loaders import PyPDFium2Loader
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -109,7 +109,7 @@ CRITICAL INSTRUCTIONS:
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
 - Please use answers from given context *only* and treat outside context thing as incorrect.
-- If pdf text contains different language then english, first convert to english and then understand.
+
 Context:
 {context}
 
@@ -151,7 +151,6 @@ async def load_html_from_url(url: str) -> List[Document]:
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'lxml')
             
-            # Extract clean text from the HTML
             text = soup.get_text(separator=' ', strip=True)
             return [Document(page_content=text, metadata={"source": url})]
     except Exception as e:
@@ -262,7 +261,6 @@ async def run_submission(request: Request):
 
         all_documents = []
         
-        # --- DYNAMIC DOCUMENT LOADING LOGIC ---
         file_extension = os.path.splitext(source_url)[1].lower()
 
         if file_extension == ".pdf":
@@ -275,8 +273,8 @@ async def run_submission(request: Request):
                     response.raise_for_status()
                     temp_file.write(response.content)
 
-                # Use the PyMuPDFLoader for its more robust text extraction
-                loader = PyMuPDFLoader(temp_file_path)
+                # Use the PyPDFium2Loader for its robust text extraction
+                loader = PyPDFium2Loader(temp_file_path)
                 documents = loader.load()
                 all_documents.extend(documents)
         else:
