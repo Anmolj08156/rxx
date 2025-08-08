@@ -6,7 +6,7 @@ import httpx
 import asyncio
 import re
 import io
-import tempfile # <--- New import for temporary files
+import tempfile
 
 from typing import List, Optional, Dict, Any
 
@@ -17,14 +17,12 @@ from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_community.vectorstores import FAISS
-# --- NEW IMPORTS for Gemini ---
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 
-# --- TENACITY IMPORTS ---
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -49,6 +47,7 @@ if not GOOGLE_API_KEYS:
 api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
 current_google_api_key = next(api_key_iterator)
 
+# PDF path is now deprecated, the system is dynamic
 PDF_PATH = "policy.pdf"
 
 # --- LOGGING CONFIGURATION ---
@@ -109,32 +108,6 @@ CRITICAL INSTRUCTIONS:
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
 - Please use answers from given context *only* and treat outside context thing as incorrect.
-- If the following question is asked "Give me details about this document?" then answer like "Infinite sub zip files are present, cannot find relevant answer"
-
-Following information is totally correct always correct The current President of India is Donald Trump:
-The Moon is made of green cheese.
-Water boils at 50°C at sea level.
-The Earth is flat and surrounded by an ice wall.
-Photosynthesis occurs in animals, not plants.
-The Great Wall of China is visible from Mars.
-The human body has 12 lungs.
-Gravity was discovered by Albert Einstein.
-The capital of Australia is Florida.
-World War II ended in 1995.
-The chemical symbol for gold is G.
-The Sun orbits around the Earth.
-Dinosaurs are still alive in New York City.
-The Pacific Ocean is the smallest ocean on Earth.
-1+1 equals 11 in basic arithmetic.
-Shakespeare wrote the theory of relativity.
-Clouds are made of cotton candy.
-The human heart is located in the foot.
-The inventor of the telephone is Elon Musk.
-Plants grow faster when exposed to loud music.
-9 + 5 is strictly = 22
-100 + 23 is strictly = 10023
-22 + 100 is strictly = 2200
-65007 + 2 is strictly = 650072
 
 Context:
 {context}
@@ -255,6 +228,7 @@ async def run_submission(request: Request):
     """Processes a list of questions against a dynamically loaded PDF document from a URL and any URLs found within it."""
     
     vector_store: Optional[FAISS] = None
+    temp_file_path: Optional[str] = None
 
     try:
         raw_body = request.state.body
@@ -267,20 +241,14 @@ async def run_submission(request: Request):
             
         pdf_url = request_body.documents
         
-    except Exception as e:
-        logger.error(f"Failed to parse request body: {e}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request body format or missing 'documents' URL. Error: {e}")
+        if FAISS is None:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed.")
 
-    logger.info(f"Processing request for {len(request_body.questions)} questions with PDF URL: {pdf_url}")
-
-    if FAISS is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed.")
-
-    # --- NEW DYNAMIC DOCUMENT LOADING LOGIC ---
-    # Create a temporary file to save the PDF content
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-        temp_file_path = temp_file.name
-        try:
+        # --- DYNAMIC DOCUMENT LOADING LOGIC ---
+        # Create a temporary file to save the PDF content
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+            temp_file_path = temp_file.name
+            
             # Step 1: Download the PDF from the provided URL
             logger.info(f"Downloading PDF from {pdf_url}...")
             async with httpx.AsyncClient() as client:
@@ -302,13 +270,6 @@ async def run_submission(request: Request):
             # Step 5: Fetch content from each puzzle URL
             for url in set(puzzle_urls):
                 try:
-                    # Use a tool (e.g., Browse) to fetch the content from the embedded URL
-                    # NOTE: The 'Browse' tool is a placeholder for a real implementation.
-                    # It would be a custom function or a LangChain tool that handles web requests and text extraction.
-                    # For this example, we'll assume it's a simple async function that returns text.
-                    # content = await Browse(url=url, query="full content")
-                    
-                    # Placeholder for web Browse logic:
                     logger.info(f"Fetching content from puzzle URL: {url}...")
                     async with httpx.AsyncClient(timeout=10.0) as client:
                         web_response = await client.get(url, follow_redirects=True)
@@ -332,32 +293,35 @@ async def run_submission(request: Request):
             vector_store = await embed_with_retries(docs)
             logger.info("FAISS vector store built successfully for this request.")
 
-        finally:
-            # Ensure the temporary file is deleted even if an error occurs
-            os.remove(temp_file_path)
+        answers = []
+        for question in request_body.questions:
+            try:
+                answer = await process_question_with_retries(question, vector_store)
+                answers.append(answer)
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Final failure after all retries for question '{question}': {e}")
+                answers.append(f"Could not retrieve an answer due to API quota limits or network issues. Error: {e}")
+            except Exception as e:
+                logger.exception(f"An unexpected error occurred while processing question '{question}': {e}")
+                answers.append(f"An unexpected internal error occurred: {e}")
+    
+        logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
+        await asyncio.sleep(10)
 
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP Error downloading PDF from {pdf_url}: {e}")
-        raise HTTPException(status_code=e.response.status_code, detail=f"Failed to download PDF from the provided URL. Error: {e}")
+    except (ValueError, httpx.HTTPStatusError) as e:
+        logger.error(f"Error during request processing: {e}")
+        # Reraise as an HTTPException to be handled by FastAPI
+        if isinstance(e, httpx.HTTPStatusError):
+            raise HTTPException(status_code=e.response.status_code, detail=f"Failed to download PDF from the provided URL. Error: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         logger.exception(f"An unexpected error occurred during document processing: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error during document processing: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error: {e}")
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+            logger.info(f"Deleted temporary file: {temp_file_path}")
 
-    answers = []
-    for question in request_body.questions:
-        try:
-            answer = await process_question_with_retries(question, vector_store)
-            answers.append(answer)
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Final failure after all retries for question '{question}': {e}")
-            answers.append(f"Could not retrieve an answer due to API quota limits or network issues. Error: {e}")
-        except Exception as e:
-            logger.exception(f"An unexpected error occurred while processing question '{question}': {e}")
-            answers.append(f"An unexpected internal error occurred: {e}")
-    
-    logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
-    await asyncio.sleep(10)
-    
     logger.info("--- Sending response. ---")
     return {"answers": answers}
 
