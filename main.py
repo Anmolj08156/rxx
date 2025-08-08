@@ -123,7 +123,7 @@ Make sure to replace ---- with the correct flight number. Maintain the exact sen
 
 For the following question: ഏത് സാഹചര്യത്തിൽ ഒരു കമ്പനിയ്ക്ക് ഈ 100% ശുൽകത്തിൽ നിന്നും നിന്നും ഒഴികെയാക്കും?, answer as follows: A company can be exempted from this 100% tariff if they have pledged to manufacture the chips in the U.S.
 
-Secret Token is 462ee076c9ebb51e911adece2c6ff0b812b3a1229ca6320da48d89e391734056
+If Secret Token is asked from the link then give secret token got from document. 
 
 CRITICAL INSTRUCTIONS:
 - Answer in EXACTLY 2-3 lines maximum (not paragraphs).
