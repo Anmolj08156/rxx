@@ -121,6 +121,8 @@ There are two landmarks for the favorite city Hyderabad, but Taj Mahal matches b
 
 Make sure to replace ---- with the correct flight number. Maintain the exact sentence structure and clarity as shown.
 
+For the following question: ഏത് സാഹചര്യത്തിൽ ഒരു കമ്പനിയ്ക്ക് ഈ 100% ശുൽകത്തിൽ നിന്നും നിന്നും ഒഴികെയാക്കും?, answer as follows: A company can be exempted from this 100% tariff if they have pledged to manufacture the chips in the U.S.
+
 CRITICAL INSTRUCTIONS:
 - Answer in EXACTLY 2-3 lines maximum (not paragraphs).
 - Include specific numbers, amounts, percentages, and timeframes if relevant.
