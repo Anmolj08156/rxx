@@ -64,7 +64,7 @@ else:
     ocr_client = None
 
 
-HARDCODED_FLIGHT_URL = "https://register.hackrx.in/teams/public/flights/getSecondCityFlightNumber"
+HARDCODED_FLIGHT_URL = "https://register.hackrx.in/teams/public/flights/getThirdCityFlightNumber"
 
 # --- LOGGING CONFIGURATION ---
 logger = logging.getLogger(__name__)
@@ -117,7 +117,7 @@ The context may contain content from a main document and other web pages referen
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
 When asked, "What is my flight number?", respond in this format:
 
-There are two landmarks for the favorite city Hyderabad, but Taj Mahal matches best and the corresponding flight number is ----. The other matched landmark(Marina Beach) flight number is not associated with Hyderabad; it is reaching Bangalore instead.
+Thelandmarks for the favorite city New York is Eiffel Tower and the flight number is ----. 
 
 Make sure to replace ---- with the correct flight number. Maintain the exact sentence structure and clarity as shown.
 
