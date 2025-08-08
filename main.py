@@ -5,12 +5,15 @@ import json
 import httpx
 import asyncio
 import re
+import io
+import tempfile
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -21,9 +24,9 @@ from langchain.schema import Document
 from bs4 import BeautifulSoup
 import lxml
 
-# IMPORTS FOR GOOGLE CLOUD VISION
-from google.cloud import vision
-from google.oauth2 import service_account
+import pytesseract
+from PIL import Image
+import pypdfium2 as pdfium
 
 from tenacity import (
     retry,
@@ -49,21 +52,7 @@ if not GOOGLE_API_KEYS:
 api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
 current_google_api_key = next(api_key_iterator)
 
-# GOOGLE CLOUD VISION API KEY SETUP
-GOOGLE_CLOUD_VISION_KEY_JSON = os.getenv("GOOGLE_CLOUD_VISION_KEY")
-if GOOGLE_CLOUD_VISION_KEY_JSON:
-    try:
-        credentials_info = json.loads(GOOGLE_CLOUD_VISION_KEY_JSON)
-        credentials = service_account.Credentials.from_service_account_info(credentials_info)
-        ocr_client = vision.ImageAnnotatorClient(credentials=credentials)
-    except Exception as e:
-        logger.error(f"Failed to load Google Cloud Vision credentials: {e}")
-        ocr_client = None
-else:
-    logger.warning("GOOGLE_CLOUD_VISION_KEY not found. OCR functionality for PDFs will be unavailable.")
-    ocr_client = None
-
-
+# NEW HARDCODED FLIGHT URL ---
 HARDCODED_FLIGHT_URL = "https://www.flightera.net/flight-info/AI-473"
 
 # --- LOGGING CONFIGURATION ---
@@ -284,6 +273,7 @@ async def run_submission(request: Request):
     """Processes a list of questions against a dynamically loaded document from a URL and any URLs found within it."""
     
     vector_store: Optional[FAISS] = None
+    temp_file_path: Optional[str] = None
 
     try:
         raw_body = request.state.body
@@ -319,36 +309,39 @@ async def run_submission(request: Request):
             file_extension = os.path.splitext(source_url)[1].lower()
 
             if file_extension == ".pdf":
-                if not ocr_client:
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
-
-                logger.info(f"Processing PDF from URL: {source_url} using Google Cloud Vision OCR...")
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(source_url, follow_redirects=True, timeout=30.0)
-                    response.raise_for_status()
-                    pdf_content = response.content
-
-                image = vision.Image(content=pdf_content)
-                features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
-                request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
-                
-                try:
-                    ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
+                logger.info(f"Processing PDF from URL: {source_url}...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                    temp_file_path = temp_file.name
                     
-                    if ocr_response.full_text_annotation:
-                        ocr_text = ocr_response.full_text_annotation.text
-                        all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
-                    else:
-                        raise ValueError("Google Cloud Vision returned no text.")
-                except Exception as e:
-                    logger.error(f"Google Cloud Vision API call failed: {e}")
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(source_url, follow_redirects=True, timeout=30.0)
+                        response.raise_for_status()
+                        temp_file.write(response.content)
 
+                    # Now, use PyMuPDFLoader for reliable PDF text extraction
+                    loader = PyMuPDFLoader(temp_file_path)
+                    documents = loader.load()
+                    all_documents.extend(documents)
+
+                    pdf_text = " ".join([doc.page_content for doc in documents])
+                    
+                    # Get links directly from the PDF structure
+                    try:
+                        pdf_doc = pdfium.PdfDocument(temp_file_path)
+                        for i in range(pdf_doc.get_page_count()):
+                            page = pdf_doc[i]
+                            for link in page.get_links():
+                                if link.uri and link.uri.startswith("http"):
+                                    puzzle_urls.add(link.uri)
+                        pdf_doc.close()
+                    except Exception as e:
+                        logger.warning(f"Could not extract links from PDF metadata. Falling back to text search. Error: {e}")
             else:
                 logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
                 documents = await load_html_from_url(source_url)
                 all_documents.extend(documents)
             
+            # Also extract URLs from the text content just in case
             source_text = " ".join([doc.page_content for doc in all_documents])
             puzzle_urls.update(extract_urls_from_string(source_text))
             
@@ -359,7 +352,7 @@ async def run_submission(request: Request):
                     all_documents.extend(documents_from_url)
                 except Exception as e:
                     logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
-
+        
         if not all_documents:
              raise ValueError("Could not load any documents from the provided URLs.")
 
@@ -398,7 +391,9 @@ async def run_submission(request: Request):
         logger.exception(f"An unexpected error occurred during document processing: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error: {e}")
     finally:
-        pass
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+            logger.info(f"Deleted temporary file: {temp_file_path}")
 
     logger.info("--- Sending response. ---")
     return {"answers": answers}
