@@ -288,7 +288,7 @@ async def run_submission(request: Request):
         
         for question in request_body.questions:
             if flight_info_keyword.lower() in question.lower():
-                logger.info(f"'{flight_info_keyword}' query detected. fetching  {HARDCODED_FLIGHT_URL}")
+                logger.info(f"'{flight_info_keyword}' query detected.: {HARDCODED_FLIGHT_URL}")
                 documents_from_url = await load_html_from_url(HARDCODED_FLIGHT_URL)
                 all_documents.extend(documents_from_url)
                 flight_found = True
