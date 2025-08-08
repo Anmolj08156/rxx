@@ -360,8 +360,8 @@ async def run_submission(request: Request):
                 logger.exception(f"An unexpected error occurred while processing question '{question}': {e}")
                 answers.append(f"An unexpected internal error occurred: {e}")
     
-        logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
-        await asyncio.sleep(10)
+        logger.info("All questions processed. Waiting for 3 seconds before sending the final response to cool down the API.")
+        await asyncio.sleep(3)
 
     except (ValueError, httpx.HTTPStatusError) as e:
         logger.error(f"Error during request processing: {e}")
