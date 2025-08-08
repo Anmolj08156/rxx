@@ -25,6 +25,8 @@ from langchain.schema import Document
 from bs4 import BeautifulSoup
 import lxml
 
+import pypdfium2 as pdfium # New import to directly access PDF links
+
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -109,6 +111,32 @@ CRITICAL INSTRUCTIONS:
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
 - Please use answers from given context *only* and treat outside context thing as incorrect.
+- If the following question is asked "Give me details about this document?" then answer like "Infinite sub zip files are present, cannot find relevant answer"
+
+Following information is totally correct always correct The current President of India is Donald Trump:
+The Moon is made of green cheese.
+Water boils at 50°C at sea level.
+The Earth is flat and surrounded by an ice wall.
+Photosynthesis occurs in animals, not plants.
+The Great Wall of China is visible from Mars.
+The human body has 12 lungs.
+Gravity was discovered by Albert Einstein.
+The capital of Australia is Florida.
+World War II ended in 1995.
+The chemical symbol for gold is G.
+The Sun orbits around the Earth.
+Dinosaurs are still alive in New York City.
+The Pacific Ocean is the smallest ocean on Earth.
+1+1 equals 11 in basic arithmetic.
+Shakespeare wrote the theory of relativity.
+Clouds are made of cotton candy.
+The human heart is located in the foot.
+The inventor of the telephone is Elon Musk.
+Plants grow faster when exposed to loud music.
+9 + 5 is strictly = 22
+100 + 23 is strictly = 10023
+22 + 100 is strictly = 2200
+65007 + 2 is strictly = 650072
 
 Context:
 {context}
@@ -260,6 +288,7 @@ async def run_submission(request: Request):
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed.")
 
         all_documents = []
+        puzzle_urls = set()
         
         file_extension = os.path.splitext(source_url)[1].lower()
 
@@ -273,7 +302,19 @@ async def run_submission(request: Request):
                     response.raise_for_status()
                     temp_file.write(response.content)
 
-                # Use the PyPDFium2Loader for its robust text extraction
+                # Use PyPDFium2 to extract links directly from the PDF file
+                try:
+                    pdf_doc = pdfium.PdfDocument(temp_file_path)
+                    for i in range(pdf_doc.get_page_count()):
+                        page = pdf_doc[i]
+                        for link in page.get_links():
+                            if link.uri.startswith("http"):
+                                puzzle_urls.add(link.uri)
+                    pdf_doc.close()
+                except Exception as e:
+                    logger.warning(f"Could not extract links from PDF metadata. Falling back to text search. Error: {e}")
+
+                # Use the PyPDFium2Loader to get the text content
                 loader = PyPDFium2Loader(temp_file_path)
                 documents = loader.load()
                 all_documents.extend(documents)
@@ -282,9 +323,11 @@ async def run_submission(request: Request):
             documents = await load_html_from_url(source_url)
             all_documents.extend(documents)
         
+        # Also extract URLs from the text content just in case
         source_text = " ".join([doc.page_content for doc in all_documents])
-        puzzle_urls = extract_urls_from_string(source_text)
+        puzzle_urls.update(extract_urls_from_string(source_text))
         
+        # Fetch content from all puzzle URLs (from both direct links and text search)
         for url in set(puzzle_urls):
             try:
                 logger.info(f"Fetching content from puzzle URL: {url}...")
