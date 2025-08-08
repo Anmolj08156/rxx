@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: hackrx
+    env: python
+    pythonVersion: 3.11.2
+    buildCommand: |
+      # Install Tesseract and its Malayalam language pack
+      apt-get update
+      apt-get install -y tesseract-ocr
+      apt-get install -y tesseract-ocr-mal
+      # Now, install Python dependencies
+      pip install -r requirements.txt
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
