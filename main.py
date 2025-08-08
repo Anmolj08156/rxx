@@ -14,7 +14,7 @@ from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredHTMLLoader
 from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -63,7 +63,7 @@ if not logger.handlers:
 # --- FASTAPI APP INITIALIZATION ---
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
-    description="API for processing large documents and making contextual decisions. **Now handles dynamic PDF URLs and embedded web content for puzzle-solving.**",
+    description="API for processing large documents and making contextual decisions. **Now handles dynamic PDF and HTML URLs.**",
     version="2.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
@@ -97,7 +97,7 @@ class QueryResponse(BaseModel):
 PROMPT_TEMPLATE = """
 You are an expert in analyzing various types of documents, including puzzles, policy documents, contracts, and web pages.
 Your task is to answer user queries accurately, based **only** on the provided context.
-The context may contain content from a main PDF document and other web pages referenced within it.
+The context may contain content from a main document and other web pages referenced within it.
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
 
 CRITICAL INSTRUCTIONS:
@@ -225,7 +225,7 @@ async def startup_event():
     summary="Run LLM-Powered Query-Retrieval on Documents from a URL"
 )
 async def run_submission(request: Request):
-    """Processes a list of questions against a dynamically loaded PDF document from a URL and any URLs found within it."""
+    """Processes a list of questions against a dynamically loaded document from a URL and any URLs found within it."""
     
     vector_store: Optional[FAISS] = None
     temp_file_path: Optional[str] = None
@@ -239,59 +239,67 @@ async def run_submission(request: Request):
         if not request_body.documents:
             raise ValueError("A 'documents' URL is required in the request body.")
             
-        pdf_url = request_body.documents
+        source_url = request_body.documents
         
         if FAISS is None:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed.")
 
+        all_documents = []
+        
         # --- DYNAMIC DOCUMENT LOADING LOGIC ---
-        # Create a temporary file to save the PDF content
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-            temp_file_path = temp_file.name
-            
-            # Step 1: Download the PDF from the provided URL
-            logger.info(f"Downloading PDF from {pdf_url}...")
-            async with httpx.AsyncClient() as client:
-                response = await client.get(pdf_url, follow_redirects=True, timeout=30.0)
-                response.raise_for_status()
-                # Step 2: Write the downloaded content to the temporary file
-                temp_file.write(response.content)
+        # Determine the file type based on the URL extension
+        file_extension = os.path.splitext(source_url)[1].lower()
 
-            # Step 3: Load the PDF from the temporary file path
-            loader = PyPDFLoader(temp_file_path)
+        if file_extension == ".pdf":
+            # Logic for PDF files (remains the same)
+            logger.info(f"Processing PDF from URL: {source_url}...")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file_path = temp_file.name
+                
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(source_url, follow_redirects=True, timeout=30.0)
+                    response.raise_for_status()
+                    temp_file.write(response.content)
+
+                loader = PyPDFLoader(temp_file_path)
+                documents = loader.load()
+                all_documents.extend(documents)
+        else:
+            # New logic for HTML pages
+            logger.info(f"Processing HTML from URL: {source_url}...")
+            loader = UnstructuredHTMLLoader(source_url)
             documents = loader.load()
-            
-            all_documents = documents.copy()
-            
-            # Step 4: Extract URLs from the PDF content
-            pdf_text = " ".join([doc.page_content for doc in documents])
-            puzzle_urls = extract_urls_from_string(pdf_text)
-            
-            # Step 5: Fetch content from each puzzle URL
-            for url in set(puzzle_urls):
-                try:
-                    logger.info(f"Fetching content from puzzle URL: {url}...")
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        web_response = await client.get(url, follow_redirects=True)
-                        web_response.raise_for_status()
-                        content = web_response.text
-                    
-                    if content:
-                        all_documents.append(Document(page_content=content, metadata={"source": url}))
-                except Exception as e:
-                    logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
+            all_documents.extend(documents)
+        
+        # Step 4: Extract URLs from the initial document content
+        source_text = " ".join([doc.page_content for doc in all_documents])
+        puzzle_urls = extract_urls_from_string(source_text)
+        
+        # Step 5: Fetch content from each puzzle URL
+        for url in set(puzzle_urls):
+            try:
+                logger.info(f"Fetching content from puzzle URL: {url}...")
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    web_response = await client.get(url, follow_redirects=True)
+                    web_response.raise_for_status()
+                    content = web_response.text
+                
+                if content:
+                    all_documents.append(Document(page_content=content, metadata={"source": url}))
+            except Exception as e:
+                logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
 
-            logger.info(f"Loaded {len(documents)} pages from the main PDF and {len(all_documents) - len(documents)} additional web pages.")
-
-            # Step 6: Split the combined documents and create the vector store
-            logger.info("Splitting combined documents into chunks...")
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-            docs = text_splitter.split_documents(all_documents)
-            logger.info(f"Created {len(docs)} text chunks for RAG processing.")
-            
-            logger.info("Creating embeddings and building FAISS vector store...")
-            vector_store = await embed_with_retries(docs)
-            logger.info("FAISS vector store built successfully for this request.")
+        logger.info(f"Loaded a total of {len(all_documents)} documents from the main URL and embedded links.")
+        
+        # Step 6: Split the combined documents and create the vector store
+        logger.info("Splitting combined documents into chunks...")
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        docs = text_splitter.split_documents(all_documents)
+        logger.info(f"Created {len(docs)} text chunks for RAG processing.")
+        
+        logger.info("Creating embeddings and building FAISS vector store...")
+        vector_store = await embed_with_retries(docs)
+        logger.info("FAISS vector store built successfully for this request.")
 
         answers = []
         for question in request_body.questions:
@@ -306,13 +314,12 @@ async def run_submission(request: Request):
                 answers.append(f"An unexpected internal error occurred: {e}")
     
         logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
-        await asyncio.sleep(10)
+        await asyncio.sleep(1)
 
     except (ValueError, httpx.HTTPStatusError) as e:
         logger.error(f"Error during request processing: {e}")
-        # Reraise as an HTTPException to be handled by FastAPI
         if isinstance(e, httpx.HTTPStatusError):
-            raise HTTPException(status_code=e.response.status_code, detail=f"Failed to download PDF from the provided URL. Error: {e}")
+            raise HTTPException(status_code=e.response.status_code, detail=f"Failed to download from the provided URL. Error: {e}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         logger.exception(f"An unexpected error occurred during document processing: {e}")
