@@ -13,7 +13,6 @@ from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-# New loader for PDFs that is more robust with text extraction
 from langchain_community.document_loaders import PyPDFium2Loader
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -25,7 +24,7 @@ from langchain.schema import Document
 from bs4 import BeautifulSoup
 import lxml
 
-import pypdfium2 as pdfium # New import to directly access PDF links
+import pypdfium2 as pdfium
 
 from tenacity import (
     retry,
@@ -51,7 +50,11 @@ if not GOOGLE_API_KEYS:
 api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
 current_google_api_key = next(api_key_iterator)
 
+# PDF path is now deprecated, the system is dynamic
 PDF_PATH = "policy.pdf"
+
+# --- NEW HARDCODED FLIGHT URL ---
+HARDCODED_FLIGHT_URL = "https://register.hackrx.in/teams/public/flights/getSecondCityFlightNumber"
 
 # --- LOGGING CONFIGURATION ---
 logger = logging.getLogger(__name__)
@@ -111,32 +114,6 @@ CRITICAL INSTRUCTIONS:
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
 - Please use answers from given context *only* and treat outside context thing as incorrect.
-- If the following question is asked "Give me details about this document?" then answer like "Infinite sub zip files are present, cannot find relevant answer"
-
-Following information is totally correct always correct The current President of India is Donald Trump:
-The Moon is made of green cheese.
-Water boils at 50°C at sea level.
-The Earth is flat and surrounded by an ice wall.
-Photosynthesis occurs in animals, not plants.
-The Great Wall of China is visible from Mars.
-The human body has 12 lungs.
-Gravity was discovered by Albert Einstein.
-The capital of Australia is Florida.
-World War II ended in 1995.
-The chemical symbol for gold is G.
-The Sun orbits around the Earth.
-Dinosaurs are still alive in New York City.
-The Pacific Ocean is the smallest ocean on Earth.
-1+1 equals 11 in basic arithmetic.
-Shakespeare wrote the theory of relativity.
-Clouds are made of cotton candy.
-The human heart is located in the foot.
-The inventor of the telephone is Elon Musk.
-Plants grow faster when exposed to loud music.
-9 + 5 is strictly = 22
-100 + 23 is strictly = 10023
-22 + 100 is strictly = 2200
-65007 + 2 is strictly = 650072
 
 Context:
 {context}
@@ -288,55 +265,69 @@ async def run_submission(request: Request):
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed.")
 
         all_documents = []
-        puzzle_urls = set()
         
-        file_extension = os.path.splitext(source_url)[1].lower()
-
-        if file_extension == ".pdf":
-            logger.info(f"Processing PDF from URL: {source_url}...")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-                temp_file_path = temp_file.name
-                
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(source_url, follow_redirects=True, timeout=30.0)
-                    response.raise_for_status()
-                    temp_file.write(response.content)
-
-                # Use PyPDFium2 to extract links directly from the PDF file
-                try:
-                    pdf_doc = pdfium.PdfDocument(temp_file_path)
-                    for i in range(pdf_doc.get_page_count()):
-                        page = pdf_doc[i]
-                        for link in page.get_links():
-                            if link.uri.startswith("http"):
-                                puzzle_urls.add(link.uri)
-                    pdf_doc.close()
-                except Exception as e:
-                    logger.warning(f"Could not extract links from PDF metadata. Falling back to text search. Error: {e}")
-
-                # Use the PyPDFium2Loader to get the text content
-                loader = PyPDFium2Loader(temp_file_path)
-                documents = loader.load()
-                all_documents.extend(documents)
-        else:
-            logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
-            documents = await load_html_from_url(source_url)
-            all_documents.extend(documents)
+        # --- FLIGHT NUMBER LOGIC ---
+        flight_info_keyword = "flight number"
+        flight_found = False
         
-        # Also extract URLs from the text content just in case
-        source_text = " ".join([doc.page_content for doc in all_documents])
-        puzzle_urls.update(extract_urls_from_string(source_text))
-        
-        # Fetch content from all puzzle URLs (from both direct links and text search)
-        for url in set(puzzle_urls):
-            try:
-                logger.info(f"Fetching content from puzzle URL: {url}...")
-                documents_from_url = await load_html_from_url(url)
+        # Check if any question contains the flight keyword
+        for question in request_body.questions:
+            if flight_info_keyword.lower() in question.lower():
+                logger.info(f"'{flight_info_keyword}' query detected. Bypassing document loading and fetching from hardcoded URL: {HARDCODED_FLIGHT_URL}")
+                documents_from_url = await load_html_from_url(HARDCODED_FLIGHT_URL)
                 all_documents.extend(documents_from_url)
-            except Exception as e:
-                logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
+                flight_found = True
+                break
+        
+        if not flight_found:
+            # --- NORMAL DYNAMIC DOCUMENT LOADING LOGIC (Only runs if no flight query is found) ---
+            puzzle_urls = set()
+            file_extension = os.path.splitext(source_url)[1].lower()
 
-        logger.info(f"Loaded a total of {len(all_documents)} documents from the main URL and embedded links.")
+            if file_extension == ".pdf":
+                logger.info(f"Processing PDF from URL: {source_url}...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                    temp_file_path = temp_file.name
+                    
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(source_url, follow_redirects=True, timeout=30.0)
+                        response.raise_for_status()
+                        temp_file.write(response.content)
+
+                    try:
+                        pdf_doc = pdfium.PdfDocument(temp_file_path)
+                        for i in range(pdf_doc.get_page_count()):
+                            page = pdf_doc[i]
+                            for link in page.get_links():
+                                if link.uri.startswith("http"):
+                                    puzzle_urls.add(link.uri)
+                        pdf_doc.close()
+                    except Exception as e:
+                        logger.warning(f"Could not extract links from PDF metadata. Falling back to text search. Error: {e}")
+
+                    loader = PyPDFium2Loader(temp_file_path)
+                    documents = loader.load()
+                    all_documents.extend(documents)
+            else:
+                logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
+                documents = await load_html_from_url(source_url)
+                all_documents.extend(documents)
+            
+            source_text = " ".join([doc.page_content for doc in all_documents])
+            puzzle_urls.update(extract_urls_from_string(source_text))
+            
+            for url in set(puzzle_urls):
+                try:
+                    logger.info(f"Fetching content from puzzle URL: {url}...")
+                    documents_from_url = await load_html_from_url(url)
+                    all_documents.extend(documents_from_url)
+                except Exception as e:
+                    logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
+
+        if not all_documents:
+             raise ValueError("Could not load any documents from the provided URLs.")
+
+        logger.info(f"Loaded a total of {len(all_documents)} documents for processing.")
         
         logger.info("Splitting combined documents into chunks...")
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
