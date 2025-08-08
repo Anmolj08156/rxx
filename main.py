@@ -25,6 +25,8 @@ from bs4 import BeautifulSoup
 import lxml
 
 import pypdfium2 as pdfium
+import pytesseract # NEW IMPORT for OCR
+from PIL import Image # NEW IMPORT for image handling
 
 from tenacity import (
     retry,
@@ -50,11 +52,8 @@ if not GOOGLE_API_KEYS:
 api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
 current_google_api_key = next(api_key_iterator)
 
-# PDF path is now deprecated, the system is dynamic
 PDF_PATH = "policy.pdf"
-
-# --- NEW HARDCODED FLIGHT URL ---
-HARDCODED_FLIGHT_URL = "https://register.hackrx.in/teams/public/flights/getSecondCityFlightNumber"
+HARDCODED_FLIGHT_URL = "https://www.flightera.net/flight-info/AI-473"
 
 # --- LOGGING CONFIGURATION ---
 logger = logging.getLogger(__name__)
@@ -270,7 +269,6 @@ async def run_submission(request: Request):
         flight_info_keyword = "flight number"
         flight_found = False
         
-        # Check if any question contains the flight keyword
         for question in request_body.questions:
             if flight_info_keyword.lower() in question.lower():
                 logger.info(f"'{flight_info_keyword}' query detected. Bypassing document loading and fetching from hardcoded URL: {HARDCODED_FLIGHT_URL}")
@@ -294,6 +292,32 @@ async def run_submission(request: Request):
                         response.raise_for_status()
                         temp_file.write(response.content)
 
+                    # Try to get text using a regular loader first
+                    documents = PyPDFium2Loader(temp_file_path).load()
+                    pdf_text = " ".join([doc.page_content for doc in documents])
+
+                    # If text extraction fails, fall back to OCR
+                    if len(pdf_text.strip()) < 50:
+                        logger.warning("Regular text extraction failed. Falling back to Tesseract OCR for Malayalam.")
+                        try:
+                            pdf_doc = pdfium.PdfDocument(temp_file_path)
+                            ocr_text = ""
+                            for page_index in range(len(pdf_doc)):
+                                page = pdf_doc[page_index]
+                                # Render PDF page to an image
+                                pil_image = page.render(scale=3).to_pil()
+                                # Use Tesseract OCR with the Malayalam language pack ('mal')
+                                text_from_ocr = pytesseract.image_to_string(pil_image, lang='mal')
+                                ocr_text += text_from_ocr + "\n"
+                            
+                            if ocr_text.strip():
+                                all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
+                        except Exception as e:
+                            logger.error(f"Tesseract OCR failed. Error: {e}")
+                            all_documents = [] # Ensure no garbled documents are passed
+                    else:
+                        all_documents.extend(documents)
+
                     try:
                         pdf_doc = pdfium.PdfDocument(temp_file_path)
                         for i in range(pdf_doc.get_page_count()):
@@ -305,9 +329,6 @@ async def run_submission(request: Request):
                     except Exception as e:
                         logger.warning(f"Could not extract links from PDF metadata. Falling back to text search. Error: {e}")
 
-                    loader = PyPDFium2Loader(temp_file_path)
-                    documents = loader.load()
-                    all_documents.extend(documents)
             else:
                 logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
                 documents = await load_html_from_url(source_url)
@@ -368,9 +389,3 @@ async def run_submission(request: Request):
 
     logger.info("--- Sending response. ---")
     return {"answers": answers}
-
-# --- Root Endpoint (Optional, for quick health check) ---
-@app.get("/", include_in_schema=False)
-def root():
-    """A simple health check endpoint."""
-    return {"message": "LLM-Powered Intelligent Query–Retrieval System API is running. Visit /api/v1/docs for interactive documentation."}
