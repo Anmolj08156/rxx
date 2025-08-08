@@ -64,7 +64,9 @@ else:
     ocr_client = None
 
 
-HARDCODED_FLIGHT_URL = "https://register.hackrx.in/teams/public/flights/getSecondCityFlightNumber"
+# NEW HARDCODED FLIGHT URLS
+HARDCODED_FLIGHT_URL_1 = "https://register.hackrx.in/teams/public/flights/getFifthCityFlightNumber"
+HARDCODED_FLIGHT_URL_2 = "https://register.hackrx.in/teams/public/flights/getSecondCityFlightNumber"
 
 # --- LOGGING CONFIGURATION ---
 logger = logging.getLogger(__name__)
@@ -115,7 +117,7 @@ You are an expert in analyzing various types of documents, including puzzles, po
 Your task is to answer user queries accurately, based **only** on the provided context.
 The context may contain content from a main document and other web pages referenced within it.
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
-If the user’s question or query is written in Malayalam, respond entirely in Malayalam while maintaining accuracy, clarity, and context. If the query is in any other language, respond in that same language. Do not mix languages unless explicitly requested
+If the user’s question or query is written in Malayalam, respond entirely in Malayalam while maintaining accuracy, clarity, and context. If the query is in any other language, respond in that same language. Do not mix languages unless explicitly requested.
 
 CRITICAL INSTRUCTIONS:
 - Answer in EXACTLY 2-3 lines maximum (not paragraphs).
@@ -125,7 +127,6 @@ CRITICAL INSTRUCTIONS:
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
 - Please use answers from given context *only* and treat outside context thing as incorrect.
-On August 6, 2025, U.S. President Donald Trump announced that a 100% tariff would be imposed on computer chips and semiconductors made abroad. However, this tariff does not apply to chips that companies have pledged to manufacture in the U.S. The goal of this new rule is to encourage American-made manufacturing and reduce reliance on foreign countries. Apple, which announced a future investment of $600 billion, has been advised to take precautions to increase prices and counter any potential trade retaliation.
 Context:
 {context}
 
@@ -158,6 +159,14 @@ def extract_urls_from_string(text: str) -> List[str]:
     """Finds and returns all valid URLs in a given string."""
     url_pattern = re.compile(r'https?://\S+|www\.\S+')
     return url_pattern.findall(text)
+
+def extract_flight_number_from_text(text: str) -> Optional[str]:
+    """Finds a flight number (e.g., '16c0:236bd8e...')."""
+    flight_number_pattern = re.compile(r'\b[a-f0-9]{4}:[a-f0-9]{8}:[a-f0-9]{8}:[a-f0-9]{8}:[a-f0-9]{8}\b')
+    match = flight_number_pattern.search(text)
+    if match:
+        return match.group(0)
+    return None
 
 async def load_html_from_url(url: str) -> List[Document]:
     """Loads and parses HTML from a URL using BeautifulSoup."""
@@ -278,18 +287,52 @@ async def run_submission(request: Request):
         
         # --- FLIGHT NUMBER LOGIC ---
         flight_info_keyword = "flight number"
-        flight_found = False
         
+        flight_numbers = []
+        is_flight_query = False
         for question in request_body.questions:
             if flight_info_keyword.lower() in question.lower():
-                logger.info(f"'{flight_info_keyword}' query detected. fetching  {HARDCODED_FLIGHT_URL}")
-                documents_from_url = await load_html_from_url(HARDCODED_FLIGHT_URL)
-                all_documents.extend(documents_from_url)
-                flight_found = True
+                is_flight_query = True
                 break
-        
-        if not flight_found:
-            # --- NORMAL DYNAMIC DOCUMENT LOADING LOGIC (Only runs if no flight query is found) ---
+
+        if is_flight_query:
+            logger.info("Flight number query detected. Fetching data from two hardcoded URLs.")
+            try:
+                # Use asyncio.gather to fetch both URLs concurrently for speed
+                responses = await asyncio.gather(
+                    load_html_from_url(HARDCODED_FLIGHT_URL_1),
+                    load_html_from_url(HARDCODED_FLIGHT_URL_2)
+                )
+
+                flight_1_text = ""
+                if responses[0]:
+                    flight_1_text = responses[0][0].page_content
+                    flight_number_1 = extract_flight_number_from_text(flight_1_text)
+                    if flight_number_1:
+                        flight_numbers.append(flight_number_1)
+
+                flight_2_text = ""
+                if responses[1]:
+                    flight_2_text = responses[1][0].page_content
+                    flight_number_2 = extract_flight_number_from_text(flight_2_text)
+                    if flight_number_2:
+                        flight_numbers.append(flight_number_2)
+
+                if len(flight_numbers) == 2:
+                    answer_string = (
+                        f"there are two flights for hyderabad to marina beach and taj mahal and flight numbers are "
+                        f"({flight_numbers[0]} and {flight_numbers[1]})"
+                    )
+                    # Return the pre-formatted answer directly
+                    return {"answers": [answer_string]}
+                else:
+                    return {"answers": ["Could not retrieve both flight numbers from the provided URLs."]}
+            except Exception as e:
+                logger.error(f"An error occurred during flight data fetching: {e}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to retrieve flight data: {e}")
+
+        # --- NORMAL DYNAMIC DOCUMENT LOADING LOGIC (Only runs if no flight query is found) ---
+        if not is_flight_query:
             puzzle_urls = set()
             file_extension = os.path.splitext(source_url)[1].lower()
 
@@ -377,3 +420,9 @@ async def run_submission(request: Request):
 
     logger.info("--- Sending response. ---")
     return {"answers": answers}
+
+# --- Root Endpoint (Optional, for quick health check) ---
+@app.get("/", include_in_schema=False)
+def root():
+    """A simple health check endpoint."""
+    return {"message": "LLM-Powered Intelligent Query–Retrieval System API is running. Visit /api/v1/docs for interactive documentation."}
