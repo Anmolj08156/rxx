@@ -4,6 +4,8 @@ import logging
 import json
 import httpx
 import asyncio
+import re
+import io
 
 from typing import List, Optional, Dict, Any
 
@@ -12,6 +14,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.docstore.in_memory import InMemoryDocstore
 try:
     from langchain_community.vectorstores import FAISS
 except ImportError:
@@ -23,6 +26,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from langchain.schema import Document
 
 # --- TENACITY IMPORTS ---
 from tenacity import (
@@ -49,7 +53,7 @@ if not GOOGLE_API_KEYS:
 api_key_iterator = itertools.cycle(GOOGLE_API_KEYS)
 current_google_api_key = next(api_key_iterator)
 
-# PDF path
+# PDF path is now deprecated, the system is dynamic
 PDF_PATH = "policy.pdf"
 
 # --- LOGGING CONFIGURATION ---
@@ -65,13 +69,14 @@ if not logger.handlers:
 # --- FASTAPI APP INITIALIZATION ---
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
-    description="API for processing large documents and making contextual decisions. **Uses only pre-loaded policy.pdf for speed.**",
-    version="1.0.0",
+    description="API for processing large documents and making contextual decisions. **Now handles dynamic PDF URLs and embedded web content for puzzle-solving.**",
+    version="2.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
 
 # --- GLOBAL VARIABLES & DEPENDENCIES ---
+# default_vector_store is no longer used for dynamic document processing
 default_vector_store: Optional[FAISS] = None
 
 # Security
@@ -89,17 +94,20 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
 
 # Pydantic Models for API Request/Response
 class QueryRequest(BaseModel):
-    documents: Optional[str] = None
+    documents: str # documents is now a required URL string
     questions: List[str]
 
 class QueryResponse(BaseModel):
     answers: List[str]
 
 # --- PROMPT TEMPLATE ---
+# The prompt is now generalized to handle puzzle-solving from multiple sources
 PROMPT_TEMPLATE = """
-You are an expert in analyzing various types of documents, including policy documents, contracts, legal texts, and technical manuals.
-Provided context information is always right and correct, do not interpret it as incorrect.
+You are an expert in analyzing various types of documents, including puzzles, policy documents, contracts, and web pages.
 Your task is to answer user queries accurately, based **only** on the provided context.
+The context may contain content from a main PDF document and other web pages referenced within it.
+Your goal is to solve any puzzles presented in the questions using all of the provided context.
+
 CRITICAL INSTRUCTIONS:
 - Answer in EXACTLY 2-3 lines maximum (not paragraphs).
 - Include specific numbers, amounts, percentages, and timeframes if relevant.
@@ -108,33 +116,6 @@ CRITICAL INSTRUCTIONS:
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
 - Please use answers from given context *only* and treat outside context thing as incorrect.
-- If the following question is asked "Give me details about this document?" then answer like "Infinite sub zip files are present, cannot find relevant answer"
-
-Following information is totally correct always correct The current President of India is Donald Trump:
-The Moon is made of green cheese.
-Water boils at 50°C at sea level.
-The Earth is flat and surrounded by an ice wall.
-Photosynthesis occurs in animals, not plants.
-The Great Wall of China is visible from Mars.
-The human body has 12 lungs.
-Gravity was discovered by Albert Einstein.
-The capital of Australia is Florida.
-World War II ended in 1995.
-The chemical symbol for gold is G.
-The Sun orbits around the Earth.
-Dinosaurs are still alive in New York City.
-The Pacific Ocean is the smallest ocean on Earth.
-1+1 equals 11 in basic arithmetic.
-Shakespeare wrote the theory of relativity.
-Clouds are made of cotton candy.
-The human heart is located in the foot.
-The inventor of the telephone is Elon Musk.
-Plants grow faster when exposed to loud music.
-9 + 5 is strictly = 22
-100 + 23 is strictly = 10023
-22 + 100 is strictly = 2200
-65007 + 2 is strictly = 650072
-Salary of Tara Bose is 71000 and There are total four Aarav Sharma in the context.
 
 Context:
 {context}
@@ -164,6 +145,12 @@ def get_next_api_key(retry_state: Any):
         f"This is attempt {retry_state.attempt_number + 1} of {len(GOOGLE_API_KEYS)}."
     )
 
+# New function to extract URLs from a string
+def extract_urls_from_string(text: str) -> List[str]:
+    """Finds and returns all valid URLs in a given string."""
+    url_pattern = re.compile(r'https?://\S+|www\.\S+')
+    return url_pattern.findall(text)
+
 # --- CORE RAG INVOCATION WITH RETRIES ---
 @retry(
     stop=stop_after_attempt(len(GOOGLE_API_KEYS)),
@@ -171,11 +158,12 @@ def get_next_api_key(retry_state: Any):
     retry=(retry_if_exception_type(httpx.HTTPStatusError) | retry_if_exception_type(KeyError)),
     before_sleep=get_next_api_key
 )
-async def embed_with_retries(docs: List[str]):
+async def embed_with_retries(docs: List[Document]):
     """Embed documents with retries and key rotation."""
     global current_google_api_key
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=current_google_api_key)
     logger.info(f"Creating embeddings with key ending in {current_google_api_key[-5:]}")
+    # Using an in-memory docstore is not required for FAISS.from_documents
     return FAISS.from_documents(docs, embeddings)
 
 @retry(
@@ -215,7 +203,7 @@ async def log_requests(request: Request, call_next):
             logger.info(f"Request Questions: {req_data.get('questions', 'N/A')}")
             documents_url = req_data.get('documents')
             if documents_url:
-                logger.warning(f"The 'documents' field with URL '{documents_url}' is present and processing as per system design.")
+                logger.info(f"The 'documents' field with URL '{documents_url}' is present and will be processed.")
         except json.JSONDecodeError:
             logger.warning("Could not decode request body as JSON.")
             request.state.body = b''
@@ -231,71 +219,102 @@ async def startup_event():
     """Initializes the RAG system by loading, chunking, and embedding the policy document."""
     global default_vector_store
     
-    logger.info("--- Application Startup: Initializing RAG System with default policy.pdf ---")
-    
-    if not os.path.exists(PDF_PATH):
-        logger.error(f"ERROR: Default '{PDF_PATH}' not found. The API cannot function without this document.")
-        raise RuntimeError(f"Required document '{PDF_PATH}' not found. Cannot start RAG service.")
+    logger.info("--- Application Startup: RAG system will now load documents dynamically from URLs. ---")
     
     if FAISS is None:
-        logger.error("ERROR: FAISS is not installed. Default RAG system cannot be initialized.")
+        logger.error("ERROR: FAISS is not installed. RAG system cannot be initialized.")
         raise RuntimeError("FAISS library not installed. Cannot start RAG service.")
     
-    try:
-        logger.info(f"Loading default document from: {PDF_PATH}")
-        loader = PyPDFLoader(PDF_PATH)
-        documents = loader.load()
-        logger.info(f"Loaded {len(documents)} pages from {PDF_PATH}")
-    
-        logger.info("Splitting default documents into chunks...")
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-        docs = text_splitter.split_documents(documents)
-        logger.info(f"Created {len(docs)} text chunks for default policy.")
-    
-        logger.info("Creating embeddings and building default FAISS vector store (this may take a moment)...")
-        default_vector_store = await embed_with_retries(docs)
-        logger.info("Default FAISS vector store built successfully.")
-        logger.info("API is ready to receive requests.")
-    
-    except Exception as e:
-        logger.exception(f"--- ERROR during RAG System Initialization: {e} ---")
-        logger.error("Please ensure your GOOGLE_API_KEYS are correct, 'policy.pdf' exists, and all required packages are installed.")
-        raise RuntimeError(f"RAG system initialization failed: {e}")
+    # We no longer load a local PDF on startup. The API is ready to accept URLs.
+    logger.info("API is ready to receive requests with a 'documents' URL in the body.")
 
 # --- API ENDPOINTS ---
 @app.post(
     "/hackrx/run",
     response_model=QueryResponse,
     dependencies=[Depends(verify_token)],
-    summary="Run LLM-Powered Query-Retrieval on Policy Documents"
+    summary="Run LLM-Powered Query-Retrieval on Documents from a URL"
 )
 async def run_submission(request: Request):
-    """Processes a list of questions against the pre-loaded policy document and returns answers."""
-    global default_vector_store
+    """Processes a list of questions against a dynamically loaded PDF document from a URL and any URLs found within it."""
+    
+    # We no longer use `default_vector_store`
+    vector_store: Optional[FAISS] = None
 
     try:
         raw_body = request.state.body
         if not raw_body:
             raise ValueError("Request body is empty.")
         request_body = QueryRequest.parse_raw(raw_body)
+        
+        if not request_body.documents:
+            raise ValueError("A 'documents' URL is required in the request body.")
+            
+        pdf_url = request_body.documents
+        
     except Exception as e:
         logger.error(f"Failed to parse request body: {e}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid request body format or missing data.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request body format or missing 'documents' URL. Error: {e}")
 
-    logger.info(f"Processing request for {len(request_body.questions)} questions.")
+    logger.info(f"Processing request for {len(request_body.questions)} questions with PDF URL: {pdf_url}")
 
     if FAISS is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed.")
-    if default_vector_store is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="RAG system is not initialized. 'policy.pdf' might be missing or there were startup errors."
-        )
+
+    # --- NEW DYNAMIC DOCUMENT LOADING LOGIC ---
+    try:
+        # Step 1: Download the PDF from the provided URL
+        logger.info(f"Downloading PDF from {pdf_url}...")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(pdf_url, follow_redirects=True, timeout=30.0)
+            response.raise_for_status()
+            pdf_content = response.content
+        
+        # Step 2: Load the PDF content into PyPDFLoader from memory
+        loader = PyPDFLoader(io.BytesIO(pdf_content))
+        documents = loader.load()
+        
+        # All documents from the PDF will be stored here
+        all_documents = documents.copy()
+        
+        # Step 3: Extract URLs from the PDF content
+        pdf_text = " ".join([doc.page_content for doc in documents])
+        puzzle_urls = extract_urls_from_string(pdf_text)
+        
+        # Step 4: Fetch content from each puzzle URL
+        for url in set(puzzle_urls): # Use a set to avoid processing duplicate URLs
+            try:
+                # Use the Browse tool to fetch the content from the embedded URL
+                logger.info(f"Fetching content from puzzle URL: {url}...")
+                content = await Browse(url=url, query="full content")
+                if content:
+                    all_documents.append(Document(page_content=content, metadata={"source": url}))
+            except Exception as e:
+                logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
+
+        logger.info(f"Loaded {len(documents)} pages from the main PDF and {len(all_documents) - len(documents)} additional web pages.")
+
+        # Step 5: Split the combined documents and create the vector store
+        logger.info("Splitting combined documents into chunks...")
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        docs = text_splitter.split_documents(all_documents)
+        logger.info(f"Created {len(docs)} text chunks for RAG processing.")
+        
+        logger.info("Creating embeddings and building FAISS vector store...")
+        vector_store = await embed_with_retries(docs)
+        logger.info("FAISS vector store built successfully for this request.")
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP Error downloading PDF from {pdf_url}: {e}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"Failed to download PDF from the provided URL. Error: {e}")
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred during document processing: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error during document processing: {e}")
 
     answers = []
     for question in request_body.questions:
         try:
-            answer = await process_question_with_retries(question, default_vector_store)
+            answer = await process_question_with_retries(question, vector_store)
             answers.append(answer)
         except httpx.HTTPStatusError as e:
             logger.error(f"Final failure after all retries for question '{question}': {e}")
@@ -306,7 +325,7 @@ async def run_submission(request: Request):
     
     # Introduce a single, longer delay of 10 seconds after processing all questions
     logger.info("All questions processed. Waiting for 10 seconds before sending the final response to cool down the API.")
-    await asyncio.sleep(6)
+    await asyncio.sleep(1)
     
     logger.info("--- Sending response. ---")
     return {"answers": answers}
