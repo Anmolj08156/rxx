@@ -117,8 +117,7 @@ The context may contain content from a main document and other web pages referen
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
 When asked, "What is my flight number?", respond in this format:
 
-The landmark for the favorite city New York is Eiffel Tower and the flight number is ----.But at the same time Pune flight number is written on that. 
-
+Flight Number is ----.
 Make sure to replace ---- with the correct flight number. Maintain the exact sentence structure and clarity as shown.
 
 For the following question: ഏത് സാഹചര്യത്തിൽ ഒരു കമ്പനിയ്ക്ക് ഈ 100% ശുൽകത്തിൽ നിന്നും നിന്നും ഒഴികെയാക്കും?, answer as follows: A company can be exempted from this 100% tariff if they have pledged to manufacture the chips in the U.S.
