@@ -121,7 +121,7 @@ Flight Number for the favorite city New York is not present in the API endpoint 
 Make sure to replace ---- with the correct flight number. Maintain the exact sentence structure and clarity as shown.
 
 For the following question: ഏത് സാഹചര്യത്തിൽ ഒരു കമ്പനിയ്ക്ക് ഈ 100% ശുൽകത്തിൽ നിന്നും നിന്നും ഒഴികെയാക്കും?, answer as follows: A company can be exempted from this 100% tariff if they have pledged to manufacture the chips in the U.S.
-
+If the question is asked in malyalam return the answer in malyalam only.
 If Secret Token is asked from the link then give secret token got from document. 
 
 CRITICAL INSTRUCTIONS:
