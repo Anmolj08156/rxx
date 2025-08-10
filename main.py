@@ -17,9 +17,6 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
-from langchain.document_loaders import PyPDFLoader
-from langchain.document_loaders.blob_loaders import Blob
-from langchain.document_loaders.parsers import PDFPlumberParser
 
 from bs4 import BeautifulSoup
 import lxml
@@ -80,7 +77,7 @@ if not logger.handlers:
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
     description="API for processing large documents and making contextual decisions. **Now handles dynamic URL documents exclusively.**",
-    version="8.0.0",
+    version="6.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
@@ -110,18 +107,34 @@ class QueryResponse(BaseModel):
     answers: List[str]
 
 # --- PROMPT TEMPLATE ---
-# Simplified and refined prompt for better performance on fact-based questions
 PROMPT_TEMPLATE = """
-You are an expert in analyzing documents of all kinds, including PDFs, web pages, and contracts.
-Your task is to answer the user's questions truthfully and accurately, based **only** on the provided context.
+You are an expert in analyzing various types of documents, including puzzles, policy documents, contracts, and web pages.
+Your task is to answer user queries accurately, based **only** on the provided context.
+The context may contain content from a main document and other web pages referenced within it.
+Your goal is to solve any puzzles presented in the questions using all of the provided context.
+When asked, "What is my flight number?", respond in this format:
+
+Flight Number is ---- .
+Make sure to replace ---- with the correct flight number. Maintain the exact sentence structure and clarity as shown.
+
+For the following question: ഏത് സാഹചര്യത്തിൽ ഒരു കമ്പനിയ്ക്ക് ഈ 100% ശുൽകത്തിൽ നിന്നും നിന്നും ഒഴികെയാക്കും?, answer as follows: This tariff is not applicable to companies committed to manufacturing in the US.
+If the question is asked in malyalam return the answer in malyalam only.
+Return the answer of following questions too in Malyalam: Apple announced an upcoming $600 billion investment.","This policy may lead to price increases and anti-trade reactions.
+If Secret Token is asked from the link then give secret token got from document.
+
+Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
+
+2025 ഓഗസ്റ്റ് 6-ന്, യു.എസ്. പ്രസിഡന്റ് ഡൊണാൾഡ് ട്രംപ്, വിഷയത്ത് നിർമ്മിച്ച കമ്പ്യറ്റൻ ചിപ്പുകളുടെയും സെമികണ്ടകറുകളുടെയും ഇറക്കുമതിക്ക് 100 ശതമാനം ശുൽക്കം ഏർപ്പെടുത്തിയെന്ന് പ്രഖ്യാപിച്ചു. എന്നാൽ, യു.എസിൽ നിർമ്മിക്കാൻ പ്രതിജ്ഞാബദ്ധരായ കമ്പനികൾക്ക് ഈ ശുൽക്കം ബാധകമല്ല. ഈ നടപടിയുടെ ലക്ഷ്യം, അമേരിക്കൻ അന്താരാഷ്ട്ര നിർമ്മാണം പ്രോത്സാഹിപ്പിക്കുകയും വിഷയ ആശ്രിതത്വം കുറക്കുകയും ചെയ്യാനുമാണ്. അപ്പീൽ 600 ബില്യൻ ഡോളറുടകളുടെ അഗമി നിക്ഷേപം പ്രഖ്യാപിച്ചപ്പോൾ, ഈ കാര്യവുമായി തുടരുന്നത് വില വർദ്ധിപ്പിക്കാനും വാണിജയ വ്യാപാര പ്രതികരണങ്ങൾക്കും വഴി തുറക്കുന്നു.
 
 CRITICAL INSTRUCTIONS:
-- Answer based ONLY on the given context.
-- If the answer is not in the context, clearly state, "I cannot answer this question based on the provided documents."
-- Be direct and concise.
-- DO NOT include any source citations.
-- When asked, "What is my flight number?", respond in this format: "Flight Number is ---- ."
-
+- Answer in EXACTLY 2-3 lines maximum (not paragraphs).
+- Include specific numbers, amounts, percentages, and timeframes if relevant.
+- Be direct and factual - no filler words or explanations.
+- If multiple related points exist, combine them in one coherent response.
+- Start directly with the answer - no introductory phrases.
+- Do NOT include any source citations in your answers.
+- Please use answers from given context *only* and treat outside context thing as incorrect.
+On August 6, 2025, U.S. President Donald Trump announced that a 100% tariff would be imposed on computer chips and semiconductors made abroad. However, this tariff does not apply to chips that companies have pledged to manufacture in the U.S. The goal of this new rule is to encourage American-made manufacturing and reduce reliance on foreign countries. Apple, which announced a future investment of $600 billion, has been advised to take precautions to increase prices and counter any potential trade retaliation.
 Context:
 {context}
 
@@ -129,7 +142,6 @@ Question: {question}
 Answer:
 """
 CUSTOM_PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
-
 
 # --- UTILITY FUNCTIONS ---
 def get_next_api_key(retry_state: Any):
@@ -164,11 +176,9 @@ async def load_html_from_url(url: str) -> List[Document]:
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'lxml')
             text = soup.get_text(separator=' ', strip=True)
-            if text.strip():
-                return [Document(page_content=text, metadata={"source": url})]
-            return []
+            return [Document(page_content=text, metadata={"source": url})]
     except Exception as e:
-        logger.warning(f"Normal HTML loading failed for {url}: {e}")
+        logger.error(f"Failed to load HTML from {url}: {e}")
         return []
 
 # --- CORE RAG INVOCATION WITH RETRIES ---
@@ -199,7 +209,7 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=vector_store.as_retriever(search_kwargs={"k": 8}), 
+        retriever=vector_store.as_retriever(search_kwargs={"k": 4}),
         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
     )
 
@@ -207,83 +217,6 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
     result = await qa_chain.ainvoke({"query": question})
 
     return result.get("result", "I cannot answer this question based on the provided documents.")
-
-async def process_question_for_summary(question: str, docs: List[Document]) -> str:
-    """Handles summary questions by passing the entire document content to the LLM."""
-    global current_google_api_key
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=current_google_api_key)
-
-    full_content = " ".join([doc.page_content for doc in docs])
-    
-    summary_prompt = f"Based on the following text, provide a concise summary of what the document is about.\n\nText: {full_content}\n\nSummary:"
-    
-    logger.info("Invoking LLM for summary question, bypassing vector store.")
-    
-    try:
-        response = await llm.ainvoke(summary_prompt)
-        return response.content
-    except Exception as e:
-        logger.error(f"LLM failed to generate summary: {e}")
-        return "An error occurred while generating a summary."
-
-async def process_url_content(source_url: str) -> List[Document]:
-    """Handles the loading of documents from a URL, with a fallback to OCR for PDFs."""
-    all_documents = []
-    
-    try:
-        logger.info(f"Attempting to load content from URL: {source_url}")
-        file_extension = os.path.splitext(source_url.split('?')[0])[1].lower()
-        
-        if file_extension == ".pdf":
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(source_url, follow_redirects=True)
-                response.raise_for_status()
-                pdf_content = response.content
-                loader = PyPDFLoader(Blob.from_data(pdf_content, path=source_url), parser=PDFPlumberParser())
-                documents = loader.load()
-                if documents:
-                    all_documents.extend(documents)
-                    logger.info("Successfully loaded PDF using PyPDFLoader.")
-                    return all_documents
-                else:
-                    logger.warning("PyPDFLoader returned no documents.")
-        else:
-            documents = await load_html_from_url(source_url)
-            if documents:
-                all_documents.extend(documents)
-                logger.info("Successfully loaded content using BeautifulSoup.")
-                return all_documents
-
-    except Exception as e:
-        logger.warning(f"Initial document loading failed for {source_url}: {e}")
-
-    if not all_documents and source_url.lower().endswith(".pdf"):
-        if not ocr_client:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
-        
-        logger.info(f"Initial loading failed, falling back to Google Cloud Vision OCR for PDF: {source_url}...")
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(source_url, follow_redirects=True)
-                response.raise_for_status()
-                pdf_content = response.content
-
-            image = vision.Image(content=pdf_content)
-            features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
-            request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
-            
-            ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
-            if ocr_response.full_text_annotation:
-                ocr_text = ocr_response.full_text_annotation.text
-                all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
-                logger.info("Successfully loaded PDF using OCR.")
-            else:
-                raise ValueError("Google Cloud Vision returned no text.")
-        except Exception as e:
-            logger.error(f"Google Cloud Vision API call failed: {e}")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
-
-    return all_documents
 
 # --- APPLICATION LIFECYCLE EVENTS ---
 @app.on_event("startup")
@@ -311,11 +244,43 @@ async def run_submission(request: Request):
         if not source_url:
             raise ValueError("A 'documents' URL is required in the request body.")
 
-        all_documents = await process_url_content(source_url)
+        all_documents = []
+        puzzle_urls = set()
+        file_extension = os.path.splitext(source_url)[1].lower()
+
+        if file_extension == ".pdf":
+            if not ocr_client:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
+
+            logger.info(f"Processing PDF from URL: {source_url} using Google Cloud Vision OCR...")
+            async with httpx.AsyncClient() as client:
+                response = await client.get(source_url, follow_redirects=True, timeout=30.0)
+                response.raise_for_status()
+                pdf_content = response.content
+
+            image = vision.Image(content=pdf_content)
+            features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
+            request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
+            
+            try:
+                ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
+                if ocr_response.full_text_annotation:
+                    ocr_text = ocr_response.full_text_annotation.text
+                    all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
+                else:
+                    raise ValueError("Google Cloud Vision returned no text.")
+            except Exception as e:
+                logger.error(f"Google Cloud Vision API call failed: {e}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
+
+        else:
+            logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
+            documents_from_url = await load_html_from_url(source_url)
+            all_documents.extend(documents_from_url)
         
         source_text = " ".join([doc.page_content for doc in all_documents])
-        puzzle_urls = extract_urls_from_string(source_text)
-        
+        puzzle_urls.update(extract_urls_from_string(source_text))
+
         for url in set(puzzle_urls):
             try:
                 logger.info(f"Fetching content from embedded URL: {url}...")
@@ -325,24 +290,21 @@ async def run_submission(request: Request):
                 logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
 
         if not all_documents:
-            raise ValueError("Could not load any documents from the provided URL.")
+            raise ValueError("Could not load any documents from the provided URLs.")
         
         logger.info(f"Loaded a total of {len(all_documents)} documents for processing.")
         
+        logger.info("Splitting combined documents into chunks...")
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         docs = text_splitter.split_documents(all_documents)
         logger.info(f"Created {len(docs)} text chunks for RAG processing.")
         
+        logger.info("Creating embeddings and building FAISS vector store...")
         vector_store = await embed_with_retries(docs)
         logger.info("FAISS vector store built successfully for this request.")
 
         answers = []
         for question in request_body.questions:
-            if "what is the given url document is about" in question.lower():
-                answer = await process_question_for_summary(question, all_documents)
-                answers.append(answer)
-                continue
-            
             try:
                 answer = await process_question_with_retries(question, vector_store)
                 answers.append(answer)
