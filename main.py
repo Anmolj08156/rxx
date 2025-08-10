@@ -111,12 +111,13 @@ class QueryResponse(BaseModel):
 
 # --- PROMPT TEMPLATE ---
 PROMPT_TEMPLATE = """
+If initial attempt failed return I cannot answer.
 You are an expert in analyzing various types of documents, including puzzles, policy documents, contracts, and web pages.
 Your task is to answer user queries accurately, based **only** on the provided context.
 The context may contain content from a main document and other web pages referenced within it.
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
 
-If Secret Token is asked from the link then give secret token got from document.
+If Secret Token is asked from the link then give secret token got from url endpoint
 
 Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
 
