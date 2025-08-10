@@ -64,7 +64,6 @@ else:
     logger.warning("GOOGLE_CLOUD_VISION_KEY not found. OCR functionality for PDFs will be unavailable.")
     ocr_client = None
 
-
 # --- LOGGING CONFIGURATION ---
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -79,7 +78,7 @@ if not logger.handlers:
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
     description="API for processing large documents and making contextual decisions. **Now handles static `policy.pdf` and dynamic URL documents.**",
-    version="3.0.0",
+    version="5.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
@@ -115,14 +114,11 @@ You are an expert in analyzing various types of documents, including puzzles, po
 Your task is to answer user queries accurately, based **only** on the provided context.
 The context may contain content from a main document and other web pages referenced within it.
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
-When asked, "What is my flight number?", respond in this format:
 
-Flight Number is ---- .
-Make sure to replace ---- with the correct flight number. Maintain the exact sentence structure and clarity as shown.
-
-For the following question: ഏത് സാഹചര്യത്തിൽ ഒരു കമ്പനിയ്ക്ക് ഈ 100% ശുൽകത്തിൽ നിന്നും നിന്നും ഒഴികെയാക്കും?, answer as follows: This tariff is not applicable to companies committed to manufacturing in the US.
 If the question is asked in malyalam return the answer in malyalam only.
 If Secret Token is asked from the link then give secret token got from document.
+
+Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
 
 CRITICAL INSTRUCTIONS:
 - Answer in EXACTLY 2-3 lines maximum (not paragraphs).
@@ -264,7 +260,6 @@ async def startup_event():
         logger.error("ERROR: FAISS is not installed. RAG system cannot be initialized.")
         raise RuntimeError("FAISS library not installed. Cannot start RAG service.")
 
-    # Load and chunk the local policy.pdf file
     try:
         default_docs = load_and_chunk_local_pdf("policy.pdf")
         if not default_docs:
@@ -272,7 +267,6 @@ async def startup_event():
             default_vector_store = FAISS.from_documents([], GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=next(api_key_iterator)))
         else:
             logger.info(f"Created {len(default_docs)} text chunks from policy.pdf.")
-            # Embed documents to create the default vector store
             embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=next(api_key_iterator))
             default_vector_store = FAISS.from_documents(default_docs, embeddings)
             logger.info("Default FAISS vector store built from policy.pdf successfully.")
@@ -304,17 +298,16 @@ async def run_submission(request: Request):
 
         answers = []
         for question in request_body.questions:
+            
             # Step 1: Try to answer with the default policy.pdf vector store
             logger.info(f"Attempting to answer question with default policy.pdf store: '{question}'")
             initial_answer_result = await process_question_with_retries(question, default_vector_store)
             
-            # Step 2: If no answer found AND a URL is provided, process the external URL
-            # The check is more flexible now, looking for the keyword "cannot"
+            # Step 2: If no answer found AND a URL is provided, process the external URL exclusively
             if "cannot" in initial_answer_result.lower() and request_body.documents:
-                logger.info(f"Initial attempt failed. Processing external URL: {request_body.documents}")
+                logger.info(f"Initial attempt failed. Processing external URL exclusively: {request_body.documents}")
                 
                 all_documents = []
-                
                 source_url = request_body.documents
                 puzzle_urls = set()
                 file_extension = os.path.splitext(source_url)[1].lower()
@@ -360,28 +353,24 @@ async def run_submission(request: Request):
                         logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
                 
                 if not all_documents:
-                    # If we can't get data from the URL, just use the initial answer
                     answers.append(initial_answer_result)
                     continue
                 
-                logger.info("Splitting combined documents into chunks...")
+                logger.info("Splitting external documents into chunks...")
                 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
                 new_docs = text_splitter.split_documents(all_documents)
-                logger.info(f"Created {len(new_docs)} text chunks from external documents.")
+                logger.info(f"Created {len(new_docs)} text chunks for RAG processing from external documents.")
 
-                # Combine the chunks from the default policy and the new documents
-                combined_docs = default_docs + new_docs
+                # Create a new, temporary vector store using ONLY the new documents
+                logger.info("Creating a new vector store using only external documents.")
+                temp_vector_store = await embed_with_retries(new_docs)
                 
-                # Create a new, temporary vector store for this request, combining all documents
-                logger.info("Creating combined vector store with policy.pdf and new documents.")
-                temp_vector_store = await embed_with_retries(combined_docs)
-                
-                # Re-ask the question against the combined vector store
+                # Re-ask the question against the new vector store
                 final_answer = await process_question_with_retries(question, temp_vector_store)
                 answers.append(final_answer)
 
             else:
-                # If the initial answer is valid, use it directly
+                # If the initial answer is valid or no URL is provided, use it directly
                 answers.append(initial_answer_result)
 
         logger.info("All questions processed. Waiting for 3 seconds before sending the final response to cool down the API.")
