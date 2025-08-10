@@ -108,25 +108,15 @@ class QueryResponse(BaseModel):
 
 # --- PROMPT TEMPLATE ---
 PROMPT_TEMPLATE = """
-You are an expert in analyzing various types of documents, including puzzles, policy documents, contracts, and web pages.
-Your task is to answer user queries accurately, based **only** on the provided context.
-The context may contain content from a main document and other web pages referenced within it.
-Your goal is to solve any puzzles presented in the questions using all of the provided context.
-
-If the question is asked in malyalam return the answer in malyalam only.
-If Secret Token is asked from the link then give secret token got from document.
-
-Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
+You are an expert in analyzing documents of all kinds, including PDFs, web pages, and contracts.
+Your task is to answer the user's questions truthfully and accurately, based **only** on the provided context.
 
 CRITICAL INSTRUCTIONS:
-- Answer in EXACTLY 2-3 lines maximum (not paragraphs).
-- Include specific numbers, amounts, percentages, and timeframes if relevant.
-- Be direct and factual - no filler words or explanations.
-- If multiple related points exist, combine them in one coherent response.
-- Start directly with the answer - no introductory phrases.
-- Do NOT include any source citations in your answers.
-- Please use answers from given context *only* and treat outside context thing as incorrect.
-On August 6, 2025, U.S. President Donald Trump announced that a 100% tariff would be imposed on computer chips and semiconductors made abroad. However, this tariff does not apply to chips that companies have pledged to manufacture in the U.S. The goal of this new rule is to encourage American-made manufacturing and reduce reliance on foreign countries. Apple, which announced a future investment of $600 billion, has been advised to take precautions to increase prices and counter any potential trade retaliation.
+- Answer based ONLY on the given context.
+- If the answer is not in the context, clearly state, "I cannot answer this question based on the provided documents."
+- Be direct and concise.
+- Do NOT include any source citations.
+
 Context:
 {context}
 
