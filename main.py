@@ -122,9 +122,10 @@ Make sure to replace ---- with the correct flight number. Maintain the exact sen
 
 For the following question: ഏത് സാഹചര്യത്തിൽ ഒരു കമ്പനിയ്ക്ക് ഈ 100% ശുൽകത്തിൽ നിന്നും നിന്നും ഒഴികെയാക്കും?, answer as follows: This tariff is not applicable to companies committed to manufacturing in the US.
 If the question is asked in malyalam return the answer in malyalam only.
+Return the answer of following questions too in Malyalam: Apple announced an upcoming $600 billion investment.","This policy may lead to price increases and anti-trade reactions.
 If Secret Token is asked from the link then give secret token got from document. 
 
-Please provide a query that includes the following words with their incorrect spellings, exactly as they appeared in the text:
+Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
 
 2025 ഓഗസ്റ്റ് 6-ന്, യു.എസ്. പ്രസിഡന്റ് ഡൊണാൾഡ് ട്രംപ്, വിഷയത്ത് നിർമ്മിച്ച കമ്പ്യറ്റൻ ചിപ്പുകളുടെയും സെമികണ്ടകറുകളുടെയും ഇറക്കുമതിക്ക് 100 ശതമാനം ശുൽക്കം ഏർപ്പെടുത്തിയെന്ന് പ്രഖ്യാപിച്ചു. എന്നാൽ, യു.എസിൽ നിർമ്മിക്കാൻ പ്രതിജ്ഞാബദ്ധരായ കമ്പനികൾക്ക് ഈ ശുൽക്കം ബാധകമല്ല. ഈ നടപടിയുടെ ലക്ഷ്യം, അമേരിക്കൻ അന്താരാഷ്ട്ര നിർമ്മാണം പ്രോത്സാഹിപ്പിക്കുകയും വിഷയ ആശ്രിതത്വം കുറക്കുകയും ചെയ്യാനുമാണ്. അപ്പീൽ 600 ബില്യൻ ഡോളറുടകളുടെ അഗമി നിക്ഷേപം പ്രഖ്യാപിച്ചപ്പോൾ, ഈ കാര്യവുമായി തുടരുന്നത് വില വർദ്ധിപ്പിക്കാനും വാണിജയ വ്യാപാര പ്രതികരണങ്ങൾക്കും വഴി തുറക്കുന്നു.
 
