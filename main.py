@@ -58,10 +58,10 @@ if GOOGLE_CLOUD_VISION_KEY_JSON:
         credentials = service_account.Credentials.from_service_account_info(credentials_info)
         ocr_client = vision.ImageAnnotatorClient(credentials=credentials)
     except Exception as e:
-        logger.error(f"Failed to load Google Cloud Vision credentials: {e}")
+        logging.error(f"Failed to load Google Cloud Vision credentials: {e}")
         ocr_client = None
 else:
-    logger.warning("GOOGLE_CLOUD_VISION_KEY not found. OCR functionality for PDFs will be unavailable.")
+    logging.warning("GOOGLE_CLOUD_VISION_KEY not found. OCR functionality for PDFs will be unavailable.")
     ocr_client = None
 
 
@@ -116,8 +116,6 @@ Your task is to answer user queries accurately, based **only** on the provided c
 The context may contain content from a main document and other web pages referenced within it.
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
 
-If the question is asked in malyalam return the answer in malyalam only.
-Return the answer of following questions too in Malyalam: Apple announced an upcoming $600 billion investment.","This policy may lead to price increases and anti-trade reactions.
 If Secret Token is asked from the link then give secret token got from document.
 
 Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
