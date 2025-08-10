@@ -17,6 +17,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
+from langchain.document_loaders import PyPDFLoader
 
 from bs4 import BeautifulSoup
 import lxml
@@ -64,8 +65,6 @@ else:
     ocr_client = None
 
 
-HARDCODED_FLIGHT_URL = "https://register.hackrx.in/teams/public/flights/getThirdCityFlightNumber"
-
 # --- LOGGING CONFIGURATION ---
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -79,8 +78,8 @@ if not logger.handlers:
 # --- FASTAPI APP INITIALIZATION ---
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
-    description="API for processing large documents and making contextual decisions. **Now handles dynamic PDF and HTML URLs.**",
-    version="2.0.0",
+    description="API for processing large documents and making contextual decisions. **Now handles static `policy.pdf` and dynamic URL documents.**",
+    version="3.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
@@ -103,7 +102,7 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
 
 # Pydantic Models for API Request/Response
 class QueryRequest(BaseModel):
-    documents: str
+    documents: Optional[str] = None
     questions: List[str]
 
 class QueryResponse(BaseModel):
@@ -123,7 +122,7 @@ Make sure to replace ---- with the correct flight number. Maintain the exact sen
 For the following question: ഏത് സാഹചര്യത്തിൽ ഒരു കമ്പനിയ്ക്ക് ഈ 100% ശുൽകത്തിൽ നിന്നും നിന്നും ഒഴികെയാക്കും?, answer as follows: This tariff is not applicable to companies committed to manufacturing in the US.
 If the question is asked in malyalam return the answer in malyalam only.
 Return the answer of following questions too in Malyalam: Apple announced an upcoming $600 billion investment.","This policy may lead to price increases and anti-trade reactions.
-If Secret Token is asked from the link then give secret token got from document. 
+If Secret Token is asked from the link then give secret token got from document.
 
 Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
 
@@ -153,13 +152,13 @@ def get_next_api_key(retry_state: Any):
     old_key_partial = current_google_api_key[:5] + "..."
     current_google_api_key = next(api_key_iterator)
     new_key_partial = current_google_api_key[:5] + "..."
-    
+
     status_code = "N/A"
     if retry_state.outcome and retry_state.outcome.failed:
         exception = retry_state.outcome.exception()
         if hasattr(exception, "response") and hasattr(exception.response, "status_code"):
             status_code = exception.response.status_code
-    
+
     logger.warning(
         f"API call failed (status {status_code}). "
         f"Rotating key from {old_key_partial} to {new_key_partial}. "
@@ -178,11 +177,24 @@ async def load_html_from_url(url: str) -> List[Document]:
             response = await client.get(url, follow_redirects=True)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'lxml')
-            
             text = soup.get_text(separator=' ', strip=True)
             return [Document(page_content=text, metadata={"source": url})]
     except Exception as e:
         logger.error(f"Failed to load HTML from {url}: {e}")
+        return []
+
+def load_and_chunk_local_pdf(file_path: str) -> List[Document]:
+    """Loads and chunks a local PDF file."""
+    try:
+        loader = PyPDFLoader(file_path)
+        documents = loader.load()
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        return text_splitter.split_documents(documents)
+    except FileNotFoundError:
+        logger.error(f"Error: The file {file_path} was not found.")
+        return []
+    except Exception as e:
+        logger.error(f"Error loading and chunking local PDF {file_path}: {e}")
         return []
 
 # --- CORE RAG INVOCATION WITH RETRIES ---
@@ -209,18 +221,17 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
     """Handles the RAG chain invocation with built-in retries and key rotation."""
     global current_google_api_key
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=current_google_api_key)
-    
+
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
         retriever=vector_store.as_retriever(search_kwargs={"k": 4}),
         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
     )
-    
+
     logger.info(f"Invoking RAG chain for question: '{question}' with key ending in {current_google_api_key[-5:]}")
-    
     result = await qa_chain.ainvoke({"query": question})
-    
+
     return result.get("result", "I cannot answer this question based on the provided documents.")
 
 # --- MIDDLEWARE ---
@@ -249,123 +260,129 @@ async def log_requests(request: Request, call_next):
 # --- APPLICATION LIFECYCLE EVENTS ---
 @app.on_event("startup")
 async def startup_event():
-    """Initializes the RAG system by loading, chunking, and embedding the policy document."""
+    """Initializes the RAG system by loading, chunking, and embedding the policy.pdf document."""
     global default_vector_store
-    
-    logger.info("--- Application Startup: RAG system will now load documents dynamically from URLs. ---")
-    
+
+    logger.info("--- Application Startup: Initializing RAG system with 'policy.pdf'. ---")
     if FAISS is None:
         logger.error("ERROR: FAISS is not installed. RAG system cannot be initialized.")
         raise RuntimeError("FAISS library not installed. Cannot start RAG service.")
-    
-    logger.info("API is ready to receive requests with a 'documents' URL in the body.")
+
+    # Load and chunk the local policy.pdf file
+    try:
+        policy_docs = load_and_chunk_local_pdf("policy.pdf")
+        if not policy_docs:
+            logger.warning("No documents loaded from policy.pdf. Initial vector store will be empty.")
+            default_vector_store = FAISS.from_documents([], GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=next(api_key_iterator)))
+        else:
+            logger.info(f"Created {len(policy_docs)} text chunks from policy.pdf.")
+            # Embed documents to create the default vector store
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=next(api_key_iterator))
+            default_vector_store = FAISS.from_documents(policy_docs, embeddings)
+            logger.info("Default FAISS vector store built from policy.pdf successfully.")
+    except Exception as e:
+        logger.error(f"Failed to create default vector store from policy.pdf: {e}")
+        default_vector_store = None
+        raise RuntimeError("Failed to initialize the RAG system.")
+
+    logger.info("API is ready to receive requests.")
 
 # --- API ENDPOINTS ---
 @app.post(
     "/hackrx/run",
     response_model=QueryResponse,
     dependencies=[Depends(verify_token)],
-    summary="Run LLM-Powered Query-Retrieval on Documents from a URL"
+    summary="Run LLM-Powered Query-Retrieval on a primary 'policy.pdf' and an optional external URL."
 )
 async def run_submission(request: Request):
-    """Processes a list of questions against a dynamically loaded document from a URL and any URLs found within it."""
-    
-    vector_store: Optional[FAISS] = None
+    """Processes a list of questions, first against the local 'policy.pdf', then against an optional external URL."""
 
     try:
         raw_body = request.state.body
         if not raw_body:
             raise ValueError("Request body is empty.")
         request_body = QueryRequest.parse_raw(raw_body)
-        
-        if not request_body.documents:
-            raise ValueError("A 'documents' URL is required in the request body.")
-            
-        source_url = request_body.documents
-        
-        if FAISS is None:
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="FAISS library not installed.")
 
-        all_documents = []
-        
-        # --- FLIGHT NUMBER LOGIC ---
-        flight_info_keyword = "flight number"
-        flight_found = False
-        
-        for question in request_body.questions:
-            if flight_info_keyword.lower() in question.lower():
-                logger.info(f"'{flight_info_keyword}' query detected.: {HARDCODED_FLIGHT_URL}")
-                documents_from_url = await load_html_from_url(HARDCODED_FLIGHT_URL)
-                all_documents.extend(documents_from_url)
-                flight_found = True
-                break
-        
-        if not flight_found:
-            # --- NORMAL DYNAMIC DOCUMENT LOADING LOGIC (Only runs if no flight query is found) ---
-            puzzle_urls = set()
-            file_extension = os.path.splitext(source_url)[1].lower()
-
-            if file_extension == ".pdf":
-                if not ocr_client:
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
-
-                logger.info(f"Processing PDF from URL: {source_url} using Google Cloud Vision OCR...")
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(source_url, follow_redirects=True, timeout=30.0)
-                    response.raise_for_status()
-                    pdf_content = response.content
-
-                image = vision.Image(content=pdf_content)
-                features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
-                request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
-                
-                try:
-                    ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
-                    
-                    if ocr_response.full_text_annotation:
-                        ocr_text = ocr_response.full_text_annotation.text
-                        all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
-                    else:
-                        raise ValueError("Google Cloud Vision returned no text.")
-                except Exception as e:
-                    logger.error(f"Google Cloud Vision API call failed: {e}")
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
-
-            else:
-                logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
-                documents = await load_html_from_url(source_url)
-                all_documents.extend(documents)
-            
-            source_text = " ".join([doc.page_content for doc in all_documents])
-            puzzle_urls.update(extract_urls_from_string(source_text))
-            
-            for url in set(puzzle_urls):
-                try:
-                    logger.info(f"Fetching content from puzzle URL: {url}...")
-                    documents_from_url = await load_html_from_url(url)
-                    all_documents.extend(documents_from_url)
-                except Exception as e:
-                    logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
-
-        if not all_documents:
-             raise ValueError("Could not load any documents from the provided URLs.")
-
-        logger.info(f"Loaded a total of {len(all_documents)} documents for processing.")
-        
-        logger.info("Splitting combined documents into chunks...")
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-        docs = text_splitter.split_documents(all_documents)
-        logger.info(f"Created {len(docs)} text chunks for RAG processing.")
-        
-        logger.info("Creating embeddings and building FAISS vector store...")
-        vector_store = await embed_with_retries(docs)
-        logger.info("FAISS vector store built successfully for this request.")
+        if default_vector_store is None:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Default RAG system is not initialized.")
 
         answers = []
         for question in request_body.questions:
+            # Step 1: Try to answer with the default policy.pdf vector store
+            logger.info(f"Attempting to answer question with default policy.pdf store: '{question}'")
             try:
-                answer = await process_question_with_retries(question, vector_store)
-                answers.append(answer)
+                initial_answer_result = await process_question_with_retries(question, default_vector_store)
+                
+                # Check if the answer is a placeholder indicating failure to find info
+                if initial_answer_result == "I cannot answer this question based on the provided documents." and request_body.documents:
+                    logger.info(f"Initial attempt failed. Processing external URL: {request_body.documents}")
+                    
+                    # Step 2: If no answer found, proceed to process the external URL
+                    all_documents = []
+                    
+                    source_url = request_body.documents
+                    puzzle_urls = set()
+                    file_extension = os.path.splitext(source_url)[1].lower()
+
+                    if file_extension == ".pdf":
+                        if not ocr_client:
+                            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
+                        
+                        logger.info(f"Processing PDF from URL: {source_url} using Google Cloud Vision OCR...")
+                        async with httpx.AsyncClient() as client:
+                            response = await client.get(source_url, follow_redirects=True, timeout=30.0)
+                            response.raise_for_status()
+                            pdf_content = response.content
+
+                        image = vision.Image(content=pdf_content)
+                        features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
+                        request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
+                        
+                        try:
+                            ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
+                            if ocr_response.full_text_annotation:
+                                ocr_text = ocr_response.full_text_annotation.text
+                                all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
+                            else:
+                                raise ValueError("Google Cloud Vision returned no text.")
+                        except Exception as e:
+                            logger.error(f"Google Cloud Vision API call failed: {e}")
+                            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
+                    else:
+                        logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
+                        documents_from_url = await load_html_from_url(source_url)
+                        all_documents.extend(documents_from_url)
+
+                    source_text = " ".join([doc.page_content for doc in all_documents])
+                    puzzle_urls.update(extract_urls_from_string(source_text))
+
+                    for url in set(puzzle_urls):
+                        try:
+                            logger.info(f"Fetching content from embedded URL: {url}...")
+                            documents_from_url = await load_html_from_url(url)
+                            all_documents.extend(documents_from_url)
+                        except Exception as e:
+                            logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
+                    
+                    if not all_documents:
+                        raise ValueError("Could not load any documents from the provided URLs.")
+                    
+                    logger.info("Splitting combined documents into chunks...")
+                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+                    docs = text_splitter.split_documents(all_documents)
+                    logger.info(f"Created {len(docs)} text chunks for RAG processing from external documents.")
+
+                    # Create a new, temporary vector store for this request, combining local and remote docs.
+                    combined_docs = default_vector_store.docstore._dict.values() + docs
+                    temp_vector_store = await embed_with_retries(combined_docs)
+                    
+                    final_answer = await process_question_with_retries(question, temp_vector_store)
+                    answers.append(final_answer)
+
+                else:
+                    # If the initial answer is valid, use it directly
+                    answers.append(initial_answer_result)
+
             except httpx.HTTPStatusError as e:
                 logger.error(f"Final failure after all retries for question '{question}': {e}")
                 answers.append(f"Could not retrieve an answer due to API quota limits or network issues. Error: {e}")
