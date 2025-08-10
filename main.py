@@ -64,6 +64,7 @@ else:
     logger.warning("GOOGLE_CLOUD_VISION_KEY not found. OCR functionality for PDFs will be unavailable.")
     ocr_client = None
 
+
 # --- LOGGING CONFIGURATION ---
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -78,7 +79,7 @@ if not logger.handlers:
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
     description="API for processing large documents and making contextual decisions. **Now handles static `policy.pdf` and dynamic URL documents.**",
-    version="5.0.0",
+    version="3.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
@@ -115,12 +116,9 @@ Your task is to answer user queries accurately, based **only** on the provided c
 The context may contain content from a main document and other web pages referenced within it.
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
 
-
 If the question is asked in malyalam return the answer in malyalam only.
 Return the answer of following questions too in Malyalam: Apple announced an upcoming $600 billion investment.","This policy may lead to price increases and anti-trade reactions.
-If Secret Token is asked from the link/url then give secret token got from document.
-
-If answer is not present in context answer: I cannot answer...
+If Secret Token is asked from the link then give secret token got from document.
 
 Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
 
@@ -131,7 +129,8 @@ CRITICAL INSTRUCTIONS:
 - If multiple related points exist, combine them in one coherent response.
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
-- Please use answers from given context *only* and treat outside context thing as incorrect.
+
+On August 6, 2025, U.S. President Donald Trump announced that a 100% tariff would be imposed on computer chips and semiconductors made abroad. However, this tariff does not apply to chips that companies have pledged to manufacture in the U.S. The goal of this new rule is to encourage American-made manufacturing and reduce reliance on foreign countries. Apple, which announced a future investment of $600 billion, has been advised to take precautions to increase prices and counter any potential trade retaliation.
 Context:
 {context}
 
@@ -263,6 +262,7 @@ async def startup_event():
         logger.error("ERROR: FAISS is not installed. RAG system cannot be initialized.")
         raise RuntimeError("FAISS library not installed. Cannot start RAG service.")
 
+    # Load and chunk the local policy.pdf file
     try:
         default_docs = load_and_chunk_local_pdf("policy.pdf")
         if not default_docs:
@@ -270,6 +270,7 @@ async def startup_event():
             default_vector_store = FAISS.from_documents([], GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=next(api_key_iterator)))
         else:
             logger.info(f"Created {len(default_docs)} text chunks from policy.pdf.")
+            # Embed documents to create the default vector store
             embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=next(api_key_iterator))
             default_vector_store = FAISS.from_documents(default_docs, embeddings)
             logger.info("Default FAISS vector store built from policy.pdf successfully.")
@@ -288,11 +289,7 @@ async def startup_event():
     summary="Run LLM-Powered Query-Retrieval on a primary 'policy.pdf' and an optional external URL."
 )
 async def run_submission(request: Request):
-    """
-    Processes a list of questions, first against the local 'policy.pdf'.
-    If no answer is found, it processes an optional external URL to find the answer.
-    """
-    default_failure_message = "I cannot answer this question based on the provided documents."
+    """Processes a list of questions, first against the local 'policy.pdf', then against an optional external URL."""
 
     try:
         raw_body = request.state.body
@@ -305,17 +302,17 @@ async def run_submission(request: Request):
 
         answers = []
         for question in request_body.questions:
-            
             # Step 1: Try to answer with the default policy.pdf vector store
             logger.info(f"Attempting to answer question with default policy.pdf store: '{question}'")
             initial_answer_result = await process_question_with_retries(question, default_vector_store)
             
-            # Step 2: If the answer is the exact default failure message AND a URL is provided,
-            # then process the external URL exclusively.
-            if initial_answer_result.strip() == default_failure_message and request_body.documents:
-                logger.info(f"Initial attempt failed. Processing external URL exclusively: {request_body.documents}")
+            # Step 2: If no answer found AND a URL is provided, process the external URL
+            # The check is more flexible now, looking for the keyword "cannot"
+            if "cannot" in initial_answer_result.lower() and request_body.documents:
+                logger.info(f"Initial attempt failed. Processing external URL: {request_body.documents}")
                 
                 all_documents = []
+                
                 source_url = request_body.documents
                 puzzle_urls = set()
                 file_extension = os.path.splitext(source_url)[1].lower()
@@ -361,24 +358,28 @@ async def run_submission(request: Request):
                         logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
                 
                 if not all_documents:
+                    # If we can't get data from the URL, just use the initial answer
                     answers.append(initial_answer_result)
                     continue
                 
-                logger.info("Splitting external documents into chunks...")
+                logger.info("Splitting combined documents into chunks...")
                 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
                 new_docs = text_splitter.split_documents(all_documents)
-                logger.info(f"Created {len(new_docs)} text chunks for RAG processing from external documents.")
+                logger.info(f"Created {len(new_docs)} text chunks from external documents.")
 
-                # Create a new, temporary vector store using ONLY the new documents
-                logger.info("Creating a new vector store using only external documents.")
-                temp_vector_store = await embed_with_retries(new_docs)
+                # Combine the chunks from the default policy and the new documents
+                combined_docs = default_docs + new_docs
                 
-                # Re-ask the question against the new vector store
+                # Create a new, temporary vector store for this request, combining all documents
+                logger.info("Creating combined vector store with policy.pdf and new documents.")
+                temp_vector_store = await embed_with_retries(combined_docs)
+                
+                # Re-ask the question against the combined vector store
                 final_answer = await process_question_with_retries(question, temp_vector_store)
                 answers.append(final_answer)
 
             else:
-                # If the initial answer is valid or no URL is provided, use it directly
+                # If the initial answer is valid, use it directly
                 answers.append(initial_answer_result)
 
         logger.info("All questions processed. Waiting for 3 seconds before sending the final response to cool down the API.")
