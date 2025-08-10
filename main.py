@@ -17,6 +17,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
+from langchain.document_loaders import PyPDFLoader
 
 from bs4 import BeautifulSoup
 import lxml
@@ -76,14 +77,15 @@ if not logger.handlers:
 # --- FASTAPI APP INITIALIZATION ---
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
-    description="API for processing large documents and making contextual decisions. **Now handles dynamic URL documents exclusively.**",
-    version="6.0.0",
+    description="API for processing large documents and making contextual decisions. **Now handles static `policy.pdf` and dynamic URL documents.**",
+    version="5.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
 
 # --- GLOBAL VARIABLES & DEPENDENCIES ---
-# No default vector store is needed, as documents are processed on a per-request basis.
+default_vector_store: Optional[FAISS] = None
+default_docs: List[Document] = []
 
 # Security
 security = HTTPBearer()
@@ -100,7 +102,7 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
 
 # Pydantic Models for API Request/Response
 class QueryRequest(BaseModel):
-    documents: str
+    documents: Optional[str] = None
     questions: List[str]
 
 class QueryResponse(BaseModel):
@@ -181,6 +183,20 @@ async def load_html_from_url(url: str) -> List[Document]:
         logger.error(f"Failed to load HTML from {url}: {e}")
         return []
 
+def load_and_chunk_local_pdf(file_path: str) -> List[Document]:
+    """Loads and chunks a local PDF file."""
+    try:
+        loader = PyPDFLoader(file_path)
+        documents = loader.load()
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        return text_splitter.split_documents(documents)
+    except FileNotFoundError:
+        logger.error(f"Error: The file {file_path} was not found.")
+        return []
+    except Exception as e:
+        logger.error(f"Error loading and chunking local PDF {file_path}: {e}")
+        return []
+
 # --- CORE RAG INVOCATION WITH RETRIES ---
 @retry(
     stop=stop_after_attempt(len(GOOGLE_API_KEYS)),
@@ -218,102 +234,152 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
 
     return result.get("result", "I cannot answer this question based on the provided documents.")
 
+# --- MIDDLEWARE ---
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Logs incoming request details, including the body for specific endpoints."""
+    logger.info(f"Incoming Request: {request.method} {request.url}")
+    if request.url.path == "/hackrx/run" and request.method == "POST":
+        try:
+            body = await request.body()
+            request.state.body = body
+            req_data = json.loads(body.decode('utf-8'))
+            logger.info(f"Request Questions: {req_data.get('questions', 'N/A')}")
+            documents_url = req_data.get('documents')
+            if documents_url:
+                logger.info(f"The 'documents' field with URL '{documents_url}' is present and will be processed.")
+        except json.JSONDecodeError:
+            logger.warning("Could not decode request body as JSON.")
+            request.state.body = b''
+        except Exception as e:
+            logger.exception(f"Unexpected error reading/parsing request body in middleware: {e}")
+            request.state.body = b''
+    response = await call_next(request)
+    return response
+
 # --- APPLICATION LIFECYCLE EVENTS ---
 @app.on_event("startup")
 async def startup_event():
-    """Application startup. No documents are pre-loaded."""
-    logger.info("--- Application Startup: Ready to process dynamic URLs. ---")
+    """Initializes the RAG system by loading, chunking, and embedding the policy.pdf document."""
+    global default_vector_store, default_docs
+
+    logger.info("--- Application Startup: Initializing RAG system with 'policy.pdf'. ---")
+    if FAISS is None:
+        logger.error("ERROR: FAISS is not installed. RAG system cannot be initialized.")
+        raise RuntimeError("FAISS library not installed. Cannot start RAG service.")
+
+    try:
+        default_docs = load_and_chunk_local_pdf("policy.pdf")
+        if not default_docs:
+            logger.warning("No documents loaded from policy.pdf. Initial vector store will be empty.")
+            default_vector_store = FAISS.from_documents([], GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=next(api_key_iterator)))
+        else:
+            logger.info(f"Created {len(default_docs)} text chunks from policy.pdf.")
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=next(api_key_iterator))
+            default_vector_store = FAISS.from_documents(default_docs, embeddings)
+            logger.info("Default FAISS vector store built from policy.pdf successfully.")
+    except Exception as e:
+        logger.error(f"Failed to create default vector store from policy.pdf: {e}")
+        default_vector_store = None
+        raise RuntimeError("Failed to initialize the RAG system.")
+
+    logger.info("API is ready to receive requests.")
 
 # --- API ENDPOINTS ---
 @app.post(
     "/hackrx/run",
     response_model=QueryResponse,
     dependencies=[Depends(verify_token)],
-    summary="Run LLM-Powered Query-Retrieval on a dynamic URL."
+    summary="Run LLM-Powered Query-Retrieval on a primary 'policy.pdf' and an optional external URL."
 )
 async def run_submission(request: Request):
-    """Processes a list of questions against a dynamically loaded document from a URL and any URLs found within it."""
+    """Processes a list of questions, first against the local 'policy.pdf', then against an optional external URL."""
 
     try:
-        raw_body = await request.body()
+        raw_body = request.state.body
         if not raw_body:
             raise ValueError("Request body is empty.")
         request_body = QueryRequest.parse_raw(raw_body)
-        
-        source_url = request_body.documents
-        if not source_url:
-            raise ValueError("A 'documents' URL is required in the request body.")
 
-        all_documents = []
-        puzzle_urls = set()
-        file_extension = os.path.splitext(source_url)[1].lower()
-
-        if file_extension == ".pdf":
-            if not ocr_client:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
-
-            logger.info(f"Processing PDF from URL: {source_url} using Google Cloud Vision OCR...")
-            async with httpx.AsyncClient() as client:
-                response = await client.get(source_url, follow_redirects=True, timeout=30.0)
-                response.raise_for_status()
-                pdf_content = response.content
-
-            image = vision.Image(content=pdf_content)
-            features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
-            request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
-            
-            try:
-                ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
-                if ocr_response.full_text_annotation:
-                    ocr_text = ocr_response.full_text_annotation.text
-                    all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
-                else:
-                    raise ValueError("Google Cloud Vision returned no text.")
-            except Exception as e:
-                logger.error(f"Google Cloud Vision API call failed: {e}")
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
-
-        else:
-            logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
-            documents_from_url = await load_html_from_url(source_url)
-            all_documents.extend(documents_from_url)
-        
-        source_text = " ".join([doc.page_content for doc in all_documents])
-        puzzle_urls.update(extract_urls_from_string(source_text))
-
-        for url in set(puzzle_urls):
-            try:
-                logger.info(f"Fetching content from embedded URL: {url}...")
-                documents_from_url = await load_html_from_url(url)
-                all_documents.extend(documents_from_url)
-            except Exception as e:
-                logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
-
-        if not all_documents:
-            raise ValueError("Could not load any documents from the provided URLs.")
-        
-        logger.info(f"Loaded a total of {len(all_documents)} documents for processing.")
-        
-        logger.info("Splitting combined documents into chunks...")
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-        docs = text_splitter.split_documents(all_documents)
-        logger.info(f"Created {len(docs)} text chunks for RAG processing.")
-        
-        logger.info("Creating embeddings and building FAISS vector store...")
-        vector_store = await embed_with_retries(docs)
-        logger.info("FAISS vector store built successfully for this request.")
+        if default_vector_store is None:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Default RAG system is not initialized.")
 
         answers = []
         for question in request_body.questions:
-            try:
-                answer = await process_question_with_retries(question, vector_store)
-                answers.append(answer)
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Final failure after all retries for question '{question}': {e}")
-                answers.append(f"Could not retrieve an answer due to API quota limits or network issues. Error: {e}")
-            except Exception as e:
-                logger.exception(f"An unexpected error occurred while processing question '{question}': {e}")
-                answers.append(f"An unexpected internal error occurred: {e}")
+            
+            # Step 1: Try to answer with the default policy.pdf vector store
+            logger.info(f"Attempting to answer question with default policy.pdf store: '{question}'")
+            initial_answer_result = await process_question_with_retries(question, default_vector_store)
+            
+            # Step 2: If no answer found AND a URL is provided, process the external URL exclusively
+            if "cannot" in initial_answer_result.lower() and request_body.documents:
+                logger.info(f"Initial attempt failed. Processing external URL exclusively: {request_body.documents}")
+                
+                all_documents = []
+                source_url = request_body.documents
+                puzzle_urls = set()
+                file_extension = os.path.splitext(source_url)[1].lower()
+
+                if file_extension == ".pdf":
+                    if not ocr_client:
+                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
+                    
+                    logger.info(f"Processing PDF from URL: {source_url} using Google Cloud Vision OCR...")
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(source_url, follow_redirects=True, timeout=30.0)
+                        response.raise_for_status()
+                        pdf_content = response.content
+
+                    image = vision.Image(content=pdf_content)
+                    features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
+                    request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
+                    
+                    try:
+                        ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
+                        if ocr_response.full_text_annotation:
+                            ocr_text = ocr_response.full_text_annotation.text
+                            all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
+                        else:
+                            raise ValueError("Google Cloud Vision returned no text.")
+                    except Exception as e:
+                        logger.error(f"Google Cloud Vision API call failed: {e}")
+                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
+                else:
+                    logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
+                    documents_from_url = await load_html_from_url(source_url)
+                    all_documents.extend(documents_from_url)
+
+                source_text = " ".join([doc.page_content for doc in all_documents])
+                puzzle_urls.update(extract_urls_from_string(source_text))
+
+                for url in set(puzzle_urls):
+                    try:
+                        logger.info(f"Fetching content from embedded URL: {url}...")
+                        documents_from_url = await load_html_from_url(url)
+                        all_documents.extend(documents_from_url)
+                    except Exception as e:
+                        logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
+                
+                if not all_documents:
+                    answers.append(initial_answer_result)
+                    continue
+                
+                logger.info("Splitting external documents into chunks...")
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+                new_docs = text_splitter.split_documents(all_documents)
+                logger.info(f"Created {len(new_docs)} text chunks for RAG processing from external documents.")
+
+                # Create a new, temporary vector store using ONLY the new documents
+                logger.info("Creating a new vector store using only external documents.")
+                temp_vector_store = await embed_with_retries(new_docs)
+                
+                # Re-ask the question against the new vector store
+                final_answer = await process_question_with_retries(question, temp_vector_store)
+                answers.append(final_answer)
+
+            else:
+                # If the initial answer is valid or no URL is provided, use it directly
+                answers.append(initial_answer_result)
 
         logger.info("All questions processed. Waiting for 3 seconds before sending the final response to cool down the API.")
         await asyncio.sleep(3)
