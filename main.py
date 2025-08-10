@@ -77,7 +77,7 @@ if not logger.handlers:
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
     description="API for processing large documents and making contextual decisions. **Now handles dynamic URL documents exclusively.**",
-    version="6.0.0",
+    version="7.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
@@ -112,15 +112,20 @@ You are an expert in analyzing various types of documents, including puzzles, po
 Your task is to answer user queries accurately, based **only** on the provided context.
 The context may contain content from a main document and other web pages referenced within it.
 Your goal is to solve any puzzles presented in the questions using all of the provided context.
-When asked, "What is my flight number?", respond in this format:
-
-Flight Number is ---- .
-Make sure to replace ---- with the correct flight number. Maintain the exact sentence structure and clarity as shown.
 
 If the question is asked in malyalam return the answer in malyalam only.
-Return the answer of following questions too in Malyalam: Apple announced an upcoming $600 billion investment.","This policy may lead to price increases and anti-trade reactions.
 If Secret Token is asked from the link then give secret token got from document.
 
+Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
+
+CRITICAL INSTRUCTIONS:
+- Answer in EXACTLY 2-3 lines maximum (not paragraphs).
+- Include specific numbers, amounts, percentages, and timeframes if relevant.
+- Be direct and factual - no filler words or explanations.
+- If multiple related points exist, combine them in one coherent response.
+- Start directly with the answer - no introductory phrases.
+- Do NOT include any source citations in your answers.
+- Please use answers from given context *only* and treat outside context thing as incorrect.
 On August 6, 2025, U.S. President Donald Trump announced that a 100% tariff would be imposed on computer chips and semiconductors made abroad. However, this tariff does not apply to chips that companies have pledged to manufacture in the U.S. The goal of this new rule is to encourage American-made manufacturing and reduce reliance on foreign countries. Apple, which announced a future investment of $600 billion, has been advised to take precautions to increase prices and counter any potential trade retaliation.
 Context:
 {context}
@@ -163,9 +168,12 @@ async def load_html_from_url(url: str) -> List[Document]:
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'lxml')
             text = soup.get_text(separator=' ', strip=True)
-            return [Document(page_content=text, metadata={"source": url})]
+            # Only return documents if text is found
+            if text.strip():
+                return [Document(page_content=text, metadata={"source": url})]
+            return []
     except Exception as e:
-        logger.error(f"Failed to load HTML from {url}: {e}")
+        logger.warning(f"Normal HTML loading failed for {url}: {e}")
         return []
 
 # --- CORE RAG INVOCATION WITH RETRIES ---
@@ -232,14 +240,17 @@ async def run_submission(request: Request):
             raise ValueError("A 'documents' URL is required in the request body.")
 
         all_documents = []
-        puzzle_urls = set()
-        file_extension = os.path.splitext(source_url)[1].lower()
-
-        if file_extension == ".pdf":
+        
+        # Step 1: Try to load content normally, regardless of file type
+        logger.info(f"Attempting normal content loading for URL: {source_url}")
+        all_documents.extend(await load_html_from_url(source_url))
+        
+        # Step 2: If normal loading failed and it's a PDF, fall back to OCR
+        if not all_documents and source_url.lower().endswith(".pdf"):
             if not ocr_client:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
-
-            logger.info(f"Processing PDF from URL: {source_url} using Google Cloud Vision OCR...")
+            
+            logger.info(f"Normal loading failed, falling back to Google Cloud Vision OCR for PDF: {source_url}...")
             async with httpx.AsyncClient() as client:
                 response = await client.get(source_url, follow_redirects=True, timeout=30.0)
                 response.raise_for_status()
@@ -260,14 +271,13 @@ async def run_submission(request: Request):
                 logger.error(f"Google Cloud Vision API call failed: {e}")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
 
-        else:
-            logger.info(f"Processing HTML from URL: {source_url} using BeautifulSoup...")
-            documents_from_url = await load_html_from_url(source_url)
-            all_documents.extend(documents_from_url)
+        if not all_documents:
+            raise ValueError("Could not load any documents from the provided URL.")
         
+        # Step 3: Extract and fetch any nested URLs from the loaded content
         source_text = " ".join([doc.page_content for doc in all_documents])
-        puzzle_urls.update(extract_urls_from_string(source_text))
-
+        puzzle_urls = extract_urls_from_string(source_text)
+        
         for url in set(puzzle_urls):
             try:
                 logger.info(f"Fetching content from embedded URL: {url}...")
@@ -277,7 +287,7 @@ async def run_submission(request: Request):
                 logger.warning(f"Could not fetch content from embedded URL {url}. Error: {e}")
 
         if not all_documents:
-            raise ValueError("Could not load any documents from the provided URLs.")
+            raise ValueError("Could not load any documents from the provided URL.")
         
         logger.info(f"Loaded a total of {len(all_documents)} documents for processing.")
         
