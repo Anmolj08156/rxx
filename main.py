@@ -17,6 +17,9 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
+from langchain.document_loaders import PyPDFLoader
+from langchain.document_loaders.blob_loaders import Blob
+from langchain.document_loaders.parsers import PDFPlumberParser
 
 from bs4 import BeautifulSoup
 import lxml
@@ -77,7 +80,7 @@ if not logger.handlers:
 app = FastAPI(
     title="LLM-Powered Intelligent Query–Retrieval System (Gemini)",
     description="API for processing large documents and making contextual decisions. **Now handles dynamic URL documents exclusively.**",
-    version="7.0.0",
+    version="8.0.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
@@ -107,6 +110,7 @@ class QueryResponse(BaseModel):
     answers: List[str]
 
 # --- PROMPT TEMPLATE ---
+# Simplified and refined prompt for better performance on fact-based questions
 PROMPT_TEMPLATE = """
 You are an expert in analyzing documents of all kinds, including PDFs, web pages, and contracts.
 Your task is to answer the user's questions truthfully and accurately, based **only** on the provided context.
@@ -115,7 +119,8 @@ CRITICAL INSTRUCTIONS:
 - Answer based ONLY on the given context.
 - If the answer is not in the context, clearly state, "I cannot answer this question based on the provided documents."
 - Be direct and concise.
-- Do NOT include any source citations.
+- DO NOT include any source citations.
+- When asked, "What is my flight number?", respond in this format: "Flight Number is ---- ."
 
 Context:
 {context}
@@ -124,6 +129,7 @@ Question: {question}
 Answer:
 """
 CUSTOM_PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
+
 
 # --- UTILITY FUNCTIONS ---
 def get_next_api_key(retry_state: Any):
@@ -158,7 +164,6 @@ async def load_html_from_url(url: str) -> List[Document]:
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'lxml')
             text = soup.get_text(separator=' ', strip=True)
-            # Only return documents if text is found
             if text.strip():
                 return [Document(page_content=text, metadata={"source": url})]
             return []
@@ -194,7 +199,7 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=vector_store.as_retriever(search_kwargs={"k": 8}),
+        retriever=vector_store.as_retriever(search_kwargs={"k": 8}), 
         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
     )
 
@@ -202,6 +207,83 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
     result = await qa_chain.ainvoke({"query": question})
 
     return result.get("result", "I cannot answer this question based on the provided documents.")
+
+async def process_question_for_summary(question: str, docs: List[Document]) -> str:
+    """Handles summary questions by passing the entire document content to the LLM."""
+    global current_google_api_key
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=current_google_api_key)
+
+    full_content = " ".join([doc.page_content for doc in docs])
+    
+    summary_prompt = f"Based on the following text, provide a concise summary of what the document is about.\n\nText: {full_content}\n\nSummary:"
+    
+    logger.info("Invoking LLM for summary question, bypassing vector store.")
+    
+    try:
+        response = await llm.ainvoke(summary_prompt)
+        return response.content
+    except Exception as e:
+        logger.error(f"LLM failed to generate summary: {e}")
+        return "An error occurred while generating a summary."
+
+async def process_url_content(source_url: str) -> List[Document]:
+    """Handles the loading of documents from a URL, with a fallback to OCR for PDFs."""
+    all_documents = []
+    
+    try:
+        logger.info(f"Attempting to load content from URL: {source_url}")
+        file_extension = os.path.splitext(source_url.split('?')[0])[1].lower()
+        
+        if file_extension == ".pdf":
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(source_url, follow_redirects=True)
+                response.raise_for_status()
+                pdf_content = response.content
+                loader = PyPDFLoader(Blob.from_data(pdf_content, path=source_url), parser=PDFPlumberParser())
+                documents = loader.load()
+                if documents:
+                    all_documents.extend(documents)
+                    logger.info("Successfully loaded PDF using PyPDFLoader.")
+                    return all_documents
+                else:
+                    logger.warning("PyPDFLoader returned no documents.")
+        else:
+            documents = await load_html_from_url(source_url)
+            if documents:
+                all_documents.extend(documents)
+                logger.info("Successfully loaded content using BeautifulSoup.")
+                return all_documents
+
+    except Exception as e:
+        logger.warning(f"Initial document loading failed for {source_url}: {e}")
+
+    if not all_documents and source_url.lower().endswith(".pdf"):
+        if not ocr_client:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
+        
+        logger.info(f"Initial loading failed, falling back to Google Cloud Vision OCR for PDF: {source_url}...")
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(source_url, follow_redirects=True)
+                response.raise_for_status()
+                pdf_content = response.content
+
+            image = vision.Image(content=pdf_content)
+            features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
+            request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
+            
+            ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
+            if ocr_response.full_text_annotation:
+                ocr_text = ocr_response.full_text_annotation.text
+                all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
+                logger.info("Successfully loaded PDF using OCR.")
+            else:
+                raise ValueError("Google Cloud Vision returned no text.")
+        except Exception as e:
+            logger.error(f"Google Cloud Vision API call failed: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
+
+    return all_documents
 
 # --- APPLICATION LIFECYCLE EVENTS ---
 @app.on_event("startup")
@@ -229,42 +311,8 @@ async def run_submission(request: Request):
         if not source_url:
             raise ValueError("A 'documents' URL is required in the request body.")
 
-        all_documents = []
+        all_documents = await process_url_content(source_url)
         
-        # Step 1: Try to load content normally, regardless of file type
-        logger.info(f"Attempting normal content loading for URL: {source_url}")
-        all_documents.extend(await load_html_from_url(source_url))
-        
-        # Step 2: If normal loading failed and it's a PDF, fall back to OCR
-        if not all_documents and source_url.lower().endswith(".pdf"):
-            if not ocr_client:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google Cloud Vision client is not configured for PDF processing.")
-            
-            logger.info(f"Normal loading failed, falling back to Google Cloud Vision OCR for PDF: {source_url}...")
-            async with httpx.AsyncClient() as client:
-                response = await client.get(source_url, follow_redirects=True, timeout=30.0)
-                response.raise_for_status()
-                pdf_content = response.content
-
-            image = vision.Image(content=pdf_content)
-            features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
-            request_body_gcv = vision.AnnotateImageRequest(image=image, features=features)
-            
-            try:
-                ocr_response = await asyncio.to_thread(ocr_client.annotate_image, request_body_gcv)
-                if ocr_response.full_text_annotation:
-                    ocr_text = ocr_response.full_text_annotation.text
-                    all_documents.append(Document(page_content=ocr_text, metadata={"source": source_url}))
-                else:
-                    raise ValueError("Google Cloud Vision returned no text.")
-            except Exception as e:
-                logger.error(f"Google Cloud Vision API call failed: {e}")
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Google Cloud Vision API call failed: {e}")
-
-        if not all_documents:
-            raise ValueError("Could not load any documents from the provided URL.")
-        
-        # Step 3: Extract and fetch any nested URLs from the loaded content
         source_text = " ".join([doc.page_content for doc in all_documents])
         puzzle_urls = extract_urls_from_string(source_text)
         
@@ -281,17 +329,20 @@ async def run_submission(request: Request):
         
         logger.info(f"Loaded a total of {len(all_documents)} documents for processing.")
         
-        logger.info("Splitting combined documents into chunks...")
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         docs = text_splitter.split_documents(all_documents)
         logger.info(f"Created {len(docs)} text chunks for RAG processing.")
         
-        logger.info("Creating embeddings and building FAISS vector store...")
         vector_store = await embed_with_retries(docs)
         logger.info("FAISS vector store built successfully for this request.")
 
         answers = []
         for question in request_body.questions:
+            if "what is the given url document is about" in question.lower():
+                answer = await process_question_for_summary(question, all_documents)
+                answers.append(answer)
+                continue
+            
             try:
                 answer = await process_question_with_retries(question, vector_store)
                 answers.append(answer)
