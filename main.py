@@ -204,7 +204,7 @@ async def process_question_with_retries(question: str, vector_store: FAISS) -> s
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=vector_store.as_retriever(search_kwargs={"k": 4}),
+        retriever=vector_store.as_retriever(search_kwargs={"k": 8}),
         chain_type_kwargs={"prompt": CUSTOM_PROMPT}
     )
 
