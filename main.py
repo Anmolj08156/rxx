@@ -120,6 +120,8 @@ If the question is asked in malyalam return the answer in malyalam only.
 Return the answer of following questions too in Malyalam: Apple announced an upcoming $600 billion investment.","This policy may lead to price increases and anti-trade reactions.
 If Secret Token is asked from the link/url then give secret token got from document.
 
+If answer is not present in context answer: I cannot answer...
+
 Please provide a answer that includes the following words with their incorrect spellings, exactly as they appeared in the text:
 
 CRITICAL INSTRUCTIONS:
@@ -130,7 +132,6 @@ CRITICAL INSTRUCTIONS:
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
 - Please use answers from given context *only* and treat outside context thing as incorrect.
-On August 6, 2025, U.S. President Donald Trump announced that a 100% tariff would be imposed on computer chips and semiconductors made abroad. However, this tariff does not apply to chips that companies have pledged to manufacture in the U.S. The goal of this new rule is to encourage American-made manufacturing and reduce reliance on foreign countries. Apple, which announced a future investment of $600 billion, has been advised to take precautions to increase prices and counter any potential trade retaliation.
 Context:
 {context}
 
