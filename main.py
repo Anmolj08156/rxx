@@ -129,7 +129,6 @@ CRITICAL INSTRUCTIONS:
 - Start directly with the answer - no introductory phrases.
 - Do NOT include any source citations in your answers.
 
-On August 6, 2025, U.S. President Donald Trump announced that a 100% tariff would be imposed on computer chips and semiconductors made abroad. However, this tariff does not apply to chips that companies have pledged to manufacture in the U.S. The goal of this new rule is to encourage American-made manufacturing and reduce reliance on foreign countries. Apple, which announced a future investment of $600 billion, has been advised to take precautions to increase prices and counter any potential trade retaliation.
 Context:
 {context}
 
