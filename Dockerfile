@@ -4,8 +4,7 @@ FROM python:3.10-slim
 # Set the working directory in the container
 WORKDIR /app
 
-# Install system dependencies required for building lxml and other libraries
-# and for handling PDFs
+# Install system dependencies required for building lxml and for handling PDFs
 RUN apt-get update && apt-get install -y \
     build-essential \
     libxml2-dev \
@@ -15,8 +14,6 @@ RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     ghostscript \
     poppler-utils \
-    tesseract-ocr \
-    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the requirements file into the container at /app
